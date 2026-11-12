@@ -24,6 +24,7 @@ internal partial class FluentWindow : W.Window
     readonly List<C.ComboBox> lightEffectChoices = new();
     readonly List<Action<LightingReadback>> lightingBindings = new();
     readonly List<Action> clearLightingDrafts = new();
+    readonly List<Func<Dictionary<string, bool>>> lightingControlStates = new();
     C.Button? saveLightingButton;
     bool closingPreview;
     readonly System.Windows.Threading.DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(2) };
@@ -44,6 +45,8 @@ internal partial class FluentWindow : W.Window
     C.CheckBox? restorePerformanceSwitch, acFullSpeedSwitch;
     bool policySaving;
     C.Slider? keyboardBrightness;
+    C.ComboBox? keyboardAudioSource;
+    Action<Color>? setKeyboardColor;
     bool keyPolling;
     bool polling, exiting, updating;
     bool performanceSelectionDirty, graphicsSelectionDirty;
@@ -218,9 +221,9 @@ internal partial class FluentWindow : W.Window
             int index = area; string id = new[] { "keyboard", "logo", "bar" }[area];
             var apply = new C.Button { Content = L.T("apply") };
             lightApplyButtons.Add(apply);
-            var dirty = new HashSet<string>(); bool built = false;
+            var dirty = new HashSet<string>(); bool built = false, refreshingControls = false; Action? refreshControls = null;
             clearLightingDrafts.Add(dirty.Clear);
-            void Changed(string field) { if (built && !updating) { dirty.Add(field); apply.IsEnabled = lightSwitches[index].IsChecked == true; Status(L.T("lightingParametersChanged")); } }
+            void Changed(string field) { refreshControls?.Invoke(); if (built && !updating) { dirty.Add(field); apply.IsEnabled = lightSwitches[index].IsChecked == true; Status(L.T("lightingParametersChanged")); } }
             var panel = new C.StackPanel(); var titleRow = new C.DockPanel();
             var enable = Switch(id, true, on => LightingOperation(async () => { if (index == 0) { await softwareLighting.Stop(); activeSoftwareLighting = null; keyboardPreviewChanged = true; } await lightingSession.Apply(() => lighting.Enable(index, on)); saveLightingButton.IsEnabled = lightingSession.Pending; apply.IsEnabled = on; }), "lightingPreviewApplied");
             lightSwitches.Add(enable); C.DockPanel.SetDock(enable, C.Dock.Right); titleRow.Children.Add(enable); var title = Text(L.T(id), 16); title.FontWeight = W.FontWeights.SemiBold; titleRow.Children.Add(title); panel.Children.Add(titleRow);
@@ -238,12 +241,21 @@ internal partial class FluentWindow : W.Window
             { effect.SelectedItem = choices.Single(choice => choice.Id == saved.Effect); bright.Value = Math.Clamp(saved.Brightness, 0, 3); speed.Value = Math.Clamp(saved.Speed, 1, 4); audio.SelectedIndex = saved.Microphone ? 1 : 0; color = Color.FromArgb(saved.Argb); }
             C.Button? colorButton = null;
             void ColorLabel() { if (colorButton != null) colorButton.Content = $"{L.T("colorPicker")} · #{color.R:X2}{color.G:X2}{color.B:X2}"; }
+            effect.SelectionChanged += (_, _) =>
+            {
+                if (built && !updating && (effect.SelectedItem as LightEffect)?.Code < 0)
+                {
+                    color = Color.FromArgb(preferences.SoftwareLighting?.Argb ?? Color.White.ToArgb());
+                    ColorLabel(); Changed("color");
+                }
+            };
             colorButton = new C.Button(); colorButton.Click += (_, _) => { using var dialog = new ColorDialog { Color = color, FullOpen = true }; if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) { color = dialog.Color; ColorLabel(); Changed("color"); } }; ColorLabel();
             var effectRow = new C.Grid { Margin = new(0, 16, 0, 0) }; effectRow.ColumnDefinitions.Add(new() { Width = new(100) }); effectRow.ColumnDefinitions.Add(new()); effectRow.Children.Add(Text(L.T("effect"))); C.Grid.SetColumn(effect, 1); effectRow.Children.Add(effect); panel.Children.Add(effectRow);
             var colorRow = new C.StackPanel { Orientation = C.Orientation.Horizontal, Margin = new(0, 10, 0, 0) }; colorRow.Children.Add(new C.TextBlock { Text = L.T("color"), Width = 100, VerticalAlignment = W.VerticalAlignment.Center }); colorRow.Children.Add(colorButton); panel.Children.Add(colorRow);
             if (area == 0)
             {
-                keyboardBrightness = bright;
+                keyboardBrightness = bright; keyboardAudioSource = audio;
+                setKeyboardColor = value => { color = value; ColorLabel(); Changed("color"); };
                 foreach (var (label, control) in new (string, W.UIElement)[] { ("brightness", bright), ("speed", speed), ("direction", direction) }) { var row = new C.StackPanel { Orientation = C.Orientation.Horizontal, Margin = new(0, 10, 0, 0) }; row.Children.Add(new C.TextBlock { Text = L.T(label), Width = 100, VerticalAlignment = W.VerticalAlignment.Center }); row.Children.Add(control); panel.Children.Add(row); }
                 audioRow = new C.StackPanel { Orientation = C.Orientation.Horizontal, Margin = new(0, 10, 0, 0), Visibility = ((LightEffect)effect.SelectedItem).Id == "audioSync" ? W.Visibility.Visible : W.Visibility.Collapsed }; audioRow.Children.Add(new C.TextBlock { Text = L.T("audioSource"), Width = 100, VerticalAlignment = W.VerticalAlignment.Center }); audioRow.Children.Add(audio); panel.Children.Add(audioRow);
                 effect.SelectionChanged += (_, _) => { audioRow.Visibility = (effect.SelectedItem as LightEffect)?.Id == "audioSync" ? W.Visibility.Visible : W.Visibility.Collapsed; };
@@ -272,15 +284,15 @@ internal partial class FluentWindow : W.Window
             var actions = Horizontal(apply); actions.HorizontalAlignment = W.HorizontalAlignment.Right; actions.Margin = new(0, 16, 0, 0); panel.Children.Add(actions); page.Children.Add(Card(panel, 20));
             lightingBindings.Add(state =>
             {
-                var config = state.Config; var preset = index == 0 ? activeSoftwareLighting : null;
+                var config = state.Config; var preset = index == 0 && config[5] == 0 && softwareLighting.Running ? activeSoftwareLighting : null;
                 int code; Color actualColor;
                 if (index == 0)
                 {
                     code = preset?.Effect switch { "screenSync" => -1, "audioSync" => -2, "soft" => -3, _ => config[5] == 11 ? 9 : config[5] };
                     int Channel(byte value) => value == 127 ? 255 : Math.Min(255, value * 2);
                     actualColor = preset != null ? Color.FromArgb(preset.Argb) : Color.FromArgb(Channel(config[18]), Channel(config[19]), Channel(config[20]));
-                    if (preset != null && preset.Brightness != config[8]) { activeSoftwareLighting = preset with { Brightness = config[8] }; preset = activeSoftwareLighting; }
-                    if (!dirty.Contains("brightness") && !bright.IsMouseCaptureWithin) bright.Value = config[8];
+                    // Real-time mode uses host-side pixel intensity; entering it forces hardware brightness to 3.
+                    if (!dirty.Contains("brightness") && !bright.IsMouseCaptureWithin) bright.Value = preset != null ? Math.Round(preset.Brightness * config[8] / 3.0) : config[8];
                     if (!dirty.Contains("speed") && !speed.IsMouseCaptureWithin) speed.Value = Math.Clamp(preset?.Speed ?? config[9], 1, 4);
                     if (!dirty.Contains("direction")) direction.SelectedItem = direction.Items.Cast<Option>().FirstOrDefault(option => option.Code == config[7]);
                     if (!dirty.Contains("audio") && preset != null) audio.SelectedIndex = preset.Microphone ? 1 : 0;
@@ -295,14 +307,39 @@ internal partial class FluentWindow : W.Window
                 if (!dirty.Contains("effect")) effect.SelectedItem = choices.FirstOrDefault(choice => choice.Code == code);
                 if (!dirty.Contains("color")) { color = actualColor; ColorLabel(); }
                 bool previouslyEnabled = enable.IsChecked == true;
-                enable.IsChecked = (config[12] & new[] { 2, 16, 32 }[index]) != 0;
+                enable.IsChecked = Lighting.AreaEnabled(config[12], index);
                 if (enable.IsChecked != true) apply.IsEnabled = false;
                 else if (!previouslyEnabled) apply.IsEnabled = true;
-                int selectedCode = (effect.SelectedItem as LightEffect)?.Code ?? 0;
-                colorButton.IsEnabled = index == 0 ? selectedCode is 9 or -1 or -2 or -3 : selectedCode is 9 or 2;
-                speed.IsEnabled = selectedCode is not (9 or -1); direction.IsEnabled = selectedCode > 0 && selectedCode != 9;
+                refreshControls?.Invoke();
             });
-            built = true;
+            refreshControls = () =>
+            {
+                if (refreshingControls) return;
+                refreshingControls = true;
+                try
+                {
+                int code = (effect.SelectedItem as LightEffect)?.Code ?? 0;
+                bool on = enable.IsChecked == true;
+                string directionLabel = code == 7 ? "clockwise" : "right";
+                if (direction.Items[0] is Option first && first.Id != directionLabel)
+                {
+                    int selectedDirection = (direction.SelectedItem as Option)?.Code ?? 1;
+                    bool wasUpdating = updating; updating = true;
+                    try { direction.Items.Clear(); direction.Items.Add(new Option(directionLabel, 1)); direction.Items.Add(new Option(code == 7 ? "counterclockwise" : "left", 0)); direction.SelectedItem = direction.Items.Cast<Option>().First(option => option.Code == selectedDirection); }
+                    finally { updating = wasUpdating; }
+                }
+                effect.IsEnabled = on; bright.IsEnabled = on;
+                colorButton.IsEnabled = on && (index == 0 ? code is 2 or 9 or -2 or -3 : code is 9 or 2);
+                speed.IsEnabled = on && index == 0 && code is 1 or 2 or 3 or 6 or 7 or 8 or -3;
+                direction.IsEnabled = on && index == 0 && code is 1 or 6 or 7;
+                audio.IsEnabled = on && index == 0 && code == -2;
+                if (!on) apply.IsEnabled = false;
+                }
+                finally { refreshingControls = false; }
+            };
+            lightingControlStates.Add(() => new() { ["effect"] = effect.IsEnabled, ["brightness"] = bright.IsEnabled, ["color"] = colorButton.IsEnabled, ["speed"] = speed.IsEnabled, ["direction"] = direction.IsEnabled, ["audio"] = audio.IsEnabled });
+            enable.Checked += (_, _) => refreshControls(); enable.Unchecked += (_, _) => refreshControls();
+            built = true; refreshControls();
         }
     }
     async Task LightingOperation(Func<Task> action)
@@ -384,7 +421,7 @@ internal partial class FluentWindow : W.Window
     async Task InitializeHardware()
     {
         try { await Task.Run(firmware.Connect); firmwareText.Text = L.T("connected"); } catch (Exception ex) { firmwareText.Text = L.Error(ex); }
-        try { lighting.Detect(); var config = await lighting.ReadConfig(); for (int i = 0; i < 3; i++) lightSwitches[i].IsChecked = (config[12] & new[] { 2, 16, 32 }[i]) != 0; lightingText.Text = L.T("connected"); } catch (Exception ex) { lightingText.Text = L.Error(ex); }
+        try { lighting.Detect(); var config = await lighting.ReadConfig(); for (int i = 0; i < 3; i++) lightSwitches[i].IsChecked = Lighting.AreaEnabled(config[12], i); lightingText.Text = L.T("connected"); } catch (Exception ex) { lightingText.Text = L.Error(ex); }
         await UpdateModes(); await PollKeys(); await Poll(); Status(L.T("ready")); await ResumeSavedSoftwareLighting(); hardwareReady.TrySetResult();
     }
     async Task UpdateModes()
@@ -558,6 +595,9 @@ internal partial class FluentWindow : W.Window
             lightEffectChoices[0].SelectedIndex = 0;
             result["parameterChangeReenablesApply"] = lightApplyButtons[0].IsEnabled;
             await CloseToTray();
+            // A saved software effect correctly resumes on close. Stop it to
+            // compare its restored hardware fallback, not the live mode-0 report.
+            await LightingOperation(async () => { await softwareLighting.Stop(); activeSoftwareLighting = null; });
             var after = await lighting.ReadConfig();
             result["closeHidesWindow"] = !IsVisible;
             result["closeRestoresSettings"] = after.AsSpan(5, 59).SequenceEqual(before.AsSpan(5, 59));
@@ -594,8 +634,8 @@ internal partial class FluentWindow : W.Window
             await CloseToTray();
             var fallback = await lighting.ReadConfig();
             result["savedSoftwareContinuesInTray"] = softwareLighting.Running;
-            result["hardwareFallbackMode"] = fallback[5];
-            result["passed"] = softwareLighting.Running && fallback[5] == 11 && !IsVisible;
+            result["activeControllerMode"] = fallback[5];
+            result["passed"] = softwareLighting.Running && fallback[5] == 0 && !IsVisible;
         }
         catch (Exception ex) { result["passed"] = false; result["error"] = ex.ToString(); }
         finally
@@ -636,6 +676,8 @@ internal partial class FluentWindow : W.Window
             SelectPage("lighting");
             lightEffectChoices[0].SelectedItem = lightEffectChoices[0].Items.Cast<LightEffect>().Single(effect => effect.Id == "audioSync");
             if (keyboardBrightness != null) keyboardBrightness.Value = 2;
+            if (keyboardAudioSource != null) keyboardAudioSource.SelectedIndex = 0;
+            setKeyboardColor?.Invoke(Color.White);
             lightApplyButtons[0].RaiseEvent(new W.RoutedEventArgs(C.Button.ClickEvent));
             for (int i = 0; i < 100 && (!softwareLighting.Running || saveLightingButton?.IsEnabled != true); i++) await Task.Delay(50);
             using var device = NAudio.Wave.WasapiLoopbackCapture.GetDefaultLoopbackCaptureDevice();
@@ -643,15 +685,19 @@ internal partial class FluentWindow : W.Window
             using var output = new NAudio.Wave.WasapiOut(device, NAudio.CoreAudioApi.AudioClientShareMode.Shared, false, 100);
             var format = NAudio.Wave.WaveFormat.CreateIeeeFloatWaveFormat(48000, 2);
             var buffer = new NAudio.Wave.BufferedWaveProvider(format);
-            var tone = new byte[48000 * 2 * 4 * 2];
-            for (int i = 0; i < 48000 * 2; i++) for (int channel = 0; channel < 2; channel++) BitConverter.GetBytes((float)(.04 * Math.Sin(2 * Math.PI * 440 * i / 48000))).CopyTo(tone, (i * 2 + channel) * 4);
+            var tone = new byte[48000 * 2 * 4 * 4];
+            for (int i = 0; i < 48000 * 4; i++) for (int channel = 0; channel < 2; channel++) BitConverter.GetBytes((float)(.04 * Math.Sin(2 * Math.PI * 440 * i / 48000))).CopyTo(tone, (i * 2 + channel) * 4);
             buffer.AddSamples(tone, 0, tone.Length); output.Init(buffer); output.Play();
             for (int i = 0; i < 60 && (softwareLighting.AudioFramesReceived == 0 || softwareLighting.AudioPeak < .0001 || softwareLighting.LitKeys == 0); i++) await Task.Delay(50);
             result["audioFramesReceived"] = softwareLighting.AudioFramesReceived; result["audioPeak"] = softwareLighting.AudioPeak; result["litKeys"] = softwareLighting.LitKeys;
+            result["controllerMode"] = (await lighting.ReadConfig())[5];
             result["controllerBrightness"] = (await lighting.ReadConfig())[8];
-            for (int i = 0; i < 20; i++) { await PollKeys(); await Task.Delay(60); }
+            var observedModes = new List<byte>();
+            for (int i = 0; i < 20; i++) { await PollKeys(); observedModes.Add((await lighting.ReadConfig())[5]); await Task.Delay(60); }
+            result["realTimeModeStayedActive"] = observedModes.All(mode => mode == 0);
+            result["framesWritten"] = softwareLighting.FramesWritten; result["changedFrames"] = softwareLighting.ChangedFrames;
             result["visualizerSelectionSurvivesReadback"] = (lightEffectChoices[0].SelectedItem as LightEffect)?.Id == "audioSync";
-            result["passed"] = softwareLighting.AudioFramesReceived > 0 && softwareLighting.AudioPeak >= .0001 && softwareLighting.LitKeys > 0 && result["visualizerSelectionSurvivesReadback"] is true;
+            result["passed"] = result["realTimeModeStayedActive"] is true && softwareLighting.FramesWritten > 10 && softwareLighting.ChangedFrames > 1 && result["controllerMode"] is byte mode && mode == 0 && softwareLighting.AudioFramesReceived > 0 && softwareLighting.AudioPeak >= .0001 && softwareLighting.LitKeys > 0 && result["visualizerSelectionSurvivesReadback"] is true;
             output.Stop(); await CloseToTray(); result["closeStopsAudio"] = !softwareLighting.Running;
         }
         catch (Exception ex) { result["passed"] = false; result["error"] = ex.ToString(); }
@@ -660,20 +706,30 @@ internal partial class FluentWindow : W.Window
     }
     internal Dictionary<string, object?> TestDisabledLightingUI()
     {
-        bool previousUpdating = updating; bool passed = true; var results = new List<bool>();
+        bool previousUpdating = updating; bool passed = true; var results = new List<bool>(); var modes = new List<object>();
         try
         {
+            updating = true;
             for (int i = 0; i < lightSwitches.Count; i++)
             {
-                bool? enabled = lightSwitches[i].IsChecked; object? selected = lightEffectChoices[i].SelectedItem;
+                updating = true; bool? enabled = lightSwitches[i].IsChecked; object? selected = lightEffectChoices[i].SelectedItem;
                 lightSwitches[i].IsChecked = false; ResetLightApplyButtons();
                 lightEffectChoices[i].SelectedIndex = (lightEffectChoices[i].SelectedIndex + 1) % lightEffectChoices[i].Items.Count;
-                bool disabled = !lightApplyButtons[i].IsEnabled; results.Add(disabled); passed &= disabled;
+                bool disabled = !lightApplyButtons[i].IsEnabled && lightingControlStates[i]().Values.All(value => !value); results.Add(disabled); passed &= disabled;
+                lightSwitches[i].IsChecked = true;
+                foreach (LightEffect choice in lightEffectChoices[i].Items)
+                {
+                    lightEffectChoices[i].SelectedItem = choice; var controls = lightingControlStates[i]();
+                    modes.Add(new { area = i, effect = choice.Id, controls });
+                    if (i == 0 && choice.Id == "screenSync") passed &= !controls["color"] && !controls["speed"] && !controls["direction"] && !controls["audio"];
+                    if (i == 0 && choice.Id == "audioSync") passed &= controls["audio"] && !controls["speed"] && !controls["direction"];
+                    if (i > 0 && choice.Id is "linked" or "linkedBar" or "gradient") passed &= !controls["color"] && !controls["speed"] && !controls["direction"] && !controls["audio"];
+                }
                 updating = true; lightSwitches[i].IsChecked = enabled; lightEffectChoices[i].SelectedItem = selected; updating = previousUpdating;
             }
         }
         finally { updating = previousUpdating; foreach (var clear in clearLightingDrafts) clear(); ResetLightApplyButtons(); }
-        return new() { ["passed"] = passed, ["disabledApplyForAllThreeAreas"] = results };
+        return new() { ["passed"] = passed, ["disabledApplyForAllThreeAreas"] = results, ["modeControls"] = modes };
     }
     public async Task Exit(bool restoreColor = false) { exiting = true; IsEnabled = false; timer.Stop(); keyTimer.Stop(); warmthTimer.Stop(); try { await RevertLighting(); } catch (Exception ex) { Store.Log(ex.ToString()); } if (restoreColor) foreach (var snapshot in preferences.ColorBackups.Values) snapshot.Restore(); Close(); }
     async Task<bool> Execute(Func<Task> action, string? successMessage = null)

@@ -92,6 +92,9 @@ internal sealed class Lighting(bool allowRemote = true) : ILighting
     // This is the OEM common-settings selector, not the flash-save operation (command 0x05).
     internal const byte NormalSettings = 1;
     internal const byte DirectSettings = 0;
+    // OEM Get/SetKbdAreaStatus: keyboard bits 0/1, logo bit 5, cover/bar bit 4.
+    internal static byte AreaMask(int area) => area switch { 0 => 3, 1 => 0x20, 2 => 0x10, _ => throw new ArgumentOutOfRangeException(nameof(area)) };
+    internal static bool AreaEnabled(byte flags, int area) => (flags & (area == 0 ? 2 : AreaMask(area))) != 0;
     internal static byte[] SettingsPayload(byte[] state, bool normalMode)
     {
         if (state.Length < 64 || state[1] != 0x57 || state[2] != 0xab || state[3] != 1) throw new ArgumentException("Invalid lighting configuration.");
@@ -108,10 +111,17 @@ internal sealed class Lighting(bool allowRemote = true) : ILighting
         // B21 common-setting encoder (OEM 2.1.1.413, 0x180192d80).
         // Match the OEM B21 CommonSetting encoder: ordinary settings use report[4] = 1.
         var p = new byte[60]; p[0] = NormalSettings; p[1] = effect == 9 ? (byte)11 : effect;
-        p[2] = 0; p[3] = (byte)Math.Clamp(direction, 0, 1); p[4] = (byte)Math.Clamp(brightness, 0, 3); p[5] = (byte)Math.Clamp(speed, 1, 4); p[7] = 0; p[8] = (byte)(config[12] | 2);
-        if (effect == 9) { p[2] = 0xff; p[14] = (byte)(color.R / 2); p[15] = (byte)(color.G / 2); p[16] = (byte)(color.B / 2); }
+        p[2] = 0; p[3] = (byte)Math.Clamp(direction, 0, 1); p[4] = (byte)Math.Clamp(brightness, 0, 3); p[5] = (byte)Math.Clamp(speed, 1, 4); p[7] = 0; p[8] = (byte)(config[12] | AreaMask(0));
         await Exchange(2, p);
         await Confirm(ReadKeyboard, state => state[5] == p[1] && state[8] == p[4], "灯效已发送，但键盘效果或亮度回读不一致。");
+        // Custom-color reports update color, not the effect's brightness/speed.
+        // The controller supports this path for breathing and static only.
+        if (effect is 2 or 9)
+        {
+            p[2] = 0xff; p[14] = (byte)(color.R / 2); p[15] = (byte)(color.G / 2); p[16] = (byte)(color.B / 2);
+            await Exchange(2, p);
+            await Confirm(ReadKeyboard, state => state[5] == p[1] && state[6] == 0xff && state.AsSpan(18, 3).SequenceEqual(p.AsSpan(14, 3)), "键盘自定义颜色回读不一致。");
+        }
     }
     public async Task Accent(bool logo, byte effect, Color color)
     {
@@ -120,18 +130,19 @@ internal sealed class Lighting(bool allowRemote = true) : ILighting
         var config = SettingsPayload(current, true);
         // OEM switches cover bit 2 and logo bits 6..7 using read-modify-write.
         config[8] = logo ? (byte)((config[8] & 0x3f) | (effect == 4 ? 0 : effect == 5 ? 0x80 : 0x40)) : (byte)(effect == 4 ? config[8] & ~4 : config[8] | 4);
-        config[8] |= logo ? (byte)0x10 : (byte)0x20;
+        config[8] |= logo ? (byte)0x20 : (byte)0x10;
         await Exchange(2, config);
         if (effect is 4 or 5) { await Confirm(ReadConfig, state => state[12] == config[8], "灯区联动回读不一致。"); return; }
         await Exchange(0xd, logo ? (byte)0 : (byte)1, effect == 9 ? (byte)1 : effect, effect is 9 or 2 ? (byte)0xff : (byte)0);
         byte[] rgb = logo ? new byte[] { 0, 0, 0x7f, color.R, color.G, color.B } : new byte[] { 1, 0, 0x7f, color.R, color.G, color.B, 1, 0x7f, color.R, color.G, color.B, 2, 0x7f, color.R, color.G, color.B };
         await Exchange(0xb, rgb);
         await Confirm(() => Exchange(0xc, logo ? (byte)0 : (byte)1), state => state[5] == (effect == 9 ? 1 : effect), "灯区模式回读不一致。");
+        if (effect is 9 or 2) await Confirm(() => Exchange(0xa, logo ? (byte)0 : (byte)1), state => state[6] == color.R && state[7] == color.G && state[8] == color.B, "灯区颜色回读不一致。");
     }
 
     public async Task Enable(int area, bool enabled)
     {
-        byte bit = area switch { 0 => 2, 1 => 0x10, 2 => 0x20, _ => throw new ArgumentOutOfRangeException(nameof(area)) };
+        byte bit = AreaMask(area);
         var current = await ReadConfig(); var payload = SettingsPayload(current, true);
         payload[8] = enabled ? (byte)(payload[8] | bit) : (byte)(payload[8] & ~bit);
         await Exchange(2, payload);

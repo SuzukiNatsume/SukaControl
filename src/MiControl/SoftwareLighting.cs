@@ -16,6 +16,8 @@ internal sealed class SoftwareLighting : IAsyncDisposable
     int samplePosition;
     double[] spectrum = new double[17];
     int framesWritten;
+    int changedFrames, previousFrameHash;
+    internal int ChangedFrames => Volatile.Read(ref changedFrames);
     long audioFramesReceived;
     double audioPeak;
     int litKeys;
@@ -30,13 +32,15 @@ internal sealed class SoftwareLighting : IAsyncDisposable
     public async Task Start(string effect, Color color, double brightness, int speed, bool microphone, string? displayName = null)
     {
         await Stop();
-        Interlocked.Exchange(ref framesWritten, 0);
+        Interlocked.Exchange(ref framesWritten, 0); changedFrames = 0; previousFrameHash = 0;
         Interlocked.Exchange(ref audioFramesReceived, 0); Volatile.Write(ref audioPeak, 0); Volatile.Write(ref spectrum, new double[17]); samplePosition = 0;
         original = await lighting.ReadConfig();
         try
         {
-            var config = Lighting.SettingsPayload(original, false); config[1] = 0xff; config[4] = (byte)Math.Clamp((int)Math.Round(brightness * 3), 0, 3); config[8] |= 2;
+            // OEM SetRealMode preserves the common report and changes only mode.
+            var config = original.Skip(4).Take(60).ToArray(); config[1] = 0;
             await lighting.Exchange(2, config);
+            await Lighting.Confirm(lighting.ReadConfig, state => state[5] == 0, "The controller did not enter real-time lighting mode.");
             if (effect == "audioSync")
             {
                 audio = microphone ? new WasapiCapture() : new WasapiLoopbackCapture();
@@ -71,7 +75,9 @@ internal sealed class SoftwareLighting : IAsyncDisposable
                             for (int y = 0; y < 6; y++) for (int x = 0; x < 17; x++) colors[y * 17 + x] = Scale(color, .35 + .65 * (.5 + .5 * Math.Sin(phase / 25 + x / 5.0 + y / 4.0)));
                         }
                         Volatile.Write(ref litKeys, colors.Count(color => color.R != 0 || color.G != 0 || color.B != 0));
-                        await WriteFrame(colors); Interlocked.Increment(ref framesWritten); phase += Math.Clamp(speed, 1, 4) * 1.2;
+                        for (int i = 0; i < colors.Length; i++) colors[i] = Scale(colors[i], brightness);
+                        int hash = 17; foreach (var value in colors) hash = unchecked(hash * 31 + value.ToArgb());
+                        await WriteFrame(colors); if (hash != previousFrameHash) { Interlocked.Increment(ref changedFrames); previousFrameHash = hash; } Interlocked.Increment(ref framesWritten); phase += Math.Clamp(speed, 1, 4) * 1.2;
                         if (!await timer.WaitForNextTickAsync(token)) break;
                     }
                 }
@@ -143,7 +149,7 @@ internal sealed class SoftwareLighting : IAsyncDisposable
             var current = Lighting.SettingsPayload(await lighting.ReadConfig(), false);
             var saved = Lighting.SettingsPayload(restore, false);
             Array.Copy(saved, 1, current, 1, 7); Array.Copy(saved, 9, current, 9, 51);
-            current[8] = (byte)((current[8] & ~2) | (saved[8] & 2));
+            current[8] = (byte)((current[8] & ~Lighting.AreaMask(0)) | (saved[8] & Lighting.AreaMask(0)));
             await lighting.Exchange(2, current);
         }
     }

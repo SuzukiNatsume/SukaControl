@@ -10,7 +10,7 @@ internal sealed class LightingSession(ILighting lighting, Func<byte[]?>? softwar
     async Task<Snapshot> Capture()
     {
         var config = await lighting.ReadConfig();
-        if (config[5] == 0xff) config = softwareBaseline?.Invoke() ?? throw new IOException("A hardware fallback is required for software lighting.");
+        if (config[5] is 0 or 0xff) config = softwareBaseline?.Invoke() ?? throw new IOException("A hardware fallback is required for software lighting.");
         return new(config, await lighting.Exchange(0xc, 0), await lighting.Exchange(0xc, 1), await lighting.Exchange(0xa, 0), await lighting.Exchange(0xa, 1));
     }
     public async Task Apply(Func<Task> action)
@@ -22,7 +22,7 @@ internal sealed class LightingSession(ILighting lighting, Func<byte[]?>? softwar
     public async Task Save()
     {
         await gate.WaitAsync();
-        try { if (baseline == null) return; if ((await lighting.ReadConfig())[5] == 0xff) throw new IOException("Stop software lighting and apply its hardware fallback before saving."); await lighting.Save(); baseline = null; }
+        try { if (baseline == null) return; if ((await lighting.ReadConfig())[5] is 0 or 0xff) throw new IOException("Stop software lighting and apply its hardware fallback before saving."); await lighting.Save(); baseline = null; }
         finally { gate.Release(); }
     }
     internal static byte[] AccentColor(byte selector, byte[] state)
