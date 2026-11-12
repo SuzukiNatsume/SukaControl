@@ -93,6 +93,15 @@ internal sealed record ColorSnapshot(string ColorKey, string[] Profiles, bool Pe
 internal sealed class DisplayControl : IDisposable
 {
     readonly Dictionary<string, ushort[]> ramps = new();
+    readonly Dictionary<string, string> rampDevices = new();
+    public void ReconcileDisplays(IReadOnlyList<DisplayTarget> connected)
+    {
+        // A recycled GDI name must never apply a disconnected monitor's calibration to a new monitor.
+        foreach (var name in ramps.Keys.ToArray())
+            if (!connected.Any(d => d.GdiName == name && rampDevices.GetValueOrDefault(name) == d.DeviceId))
+            { ramps.Remove(name); rampDevices.Remove(name); }
+        if (ramps.Count == 0) EyeEnabled = false;
+    }
     public bool EyeEnabled { get; private set; }
     public static List<DisplayTarget> Displays()
     {
@@ -144,6 +153,7 @@ internal sealed class DisplayControl : IDisposable
             {
                 original = new ushort[768]; if (!Native.GetDeviceGammaRamp(dc, original)) throw new IOException("显卡驱动不提供 Gamma 读取；HDR 模式下可能不可用。");
                 ramps[display.GdiName] = original;
+                rampDevices[display.GdiName] = display.DeviceId;
             }
             var ramp = enabled ? EyeRamp(original, warmth) : (ushort[])original.Clone();
             if (!Native.SetDeviceGammaRamp(dc, ramp)) throw new IOException("显卡未能应用本次色温调整。");
@@ -169,8 +179,10 @@ internal sealed class DisplayControl : IDisposable
     }
     public void Dispose()
     {
+        ReconcileDisplays(Displays());
         foreach (var (name, ramp) in ramps) { var dc = Native.CreateDC("DISPLAY", name, null, IntPtr.Zero); if (dc != IntPtr.Zero) { Native.SetDeviceGammaRamp(dc, ramp); Native.DeleteDC(dc); } }
         ramps.Clear();
+        rampDevices.Clear();
         EyeEnabled = false;
     }
 }

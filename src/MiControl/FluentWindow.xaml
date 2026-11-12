@@ -4,6 +4,9 @@
         Title="SukaControl" Icon="/Assets/MiControl.ico" Width="1180" Height="850" MinWidth="1000" MinHeight="740"
         WindowStartupLocation="CenterScreen" FontFamily="Segoe UI Variable, Segoe UI, Microsoft YaHei UI, Yu Gothic UI"
         FontSize="14" Foreground="{DynamicResource MainText}" Background="Transparent">
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="32" GlassFrameThickness="-1" ResizeBorderThickness="6" UseAeroCaptionButtons="True"/>
+    </WindowChrome.WindowChrome>
     <Window.Resources>
         <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"><Setter Property="Padding" Value="16,8"/><Setter Property="MinHeight" Value="34"/><Setter Property="Margin" Value="4,0,0,0"/></Style>
         <Style x:Key="NavigationItem" TargetType="ListBoxItem">
@@ -32,7 +35,7 @@
             </ControlTemplate></Setter.Value></Setter>
         </Style>
     </Window.Resources>
-    <Grid>
+    <Grid Margin="0,32,0,0">
         <Grid.ColumnDefinitions><ColumnDefinition Width="224"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
         <Grid Margin="0,16,0,12">
             <Grid.RowDefinitions><RowDefinition Height="80"/><RowDefinition Height="*"/></Grid.RowDefinitions>

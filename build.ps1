@@ -25,7 +25,7 @@ try {
         }
     }finally{$archive.Dispose()}
     $compiler=Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
-    & $compiler /nologo /target:winexe /platform:x64 /win32icon:src\MiControl\Assets\MiControl.ico /out:dist\SukaControl-Setup-0.2.2.exe /win32manifest:installer\setup.manifest /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll '/resource:installer\payload.zip,payload.zip' installer\Setup.cs
+    & $compiler /nologo /target:winexe /platform:x64 /win32icon:src\MiControl\Assets\MiControl.ico /out:dist\SukaControl-Setup-0.2.3.exe /win32manifest:installer\setup.manifest /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll '/resource:installer\payload.zip,payload.zip' installer\Setup.cs
     if($LASTEXITCODE -ne 0){throw 'Installer build failed.'}
-    Get-FileHash dist/SukaControl-Setup-0.2.2.exe -Algorithm SHA256 | Format-List
+    Get-FileHash dist/SukaControl-Setup-0.2.3.exe -Algorithm SHA256 | Format-List
 }finally{Pop-Location}

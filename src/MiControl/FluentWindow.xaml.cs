@@ -18,6 +18,8 @@ internal partial class FluentWindow : W.Window
     readonly System.Windows.Threading.DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(2) };
     readonly System.Windows.Threading.DispatcherTimer keyTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
     readonly System.Windows.Threading.DispatcherTimer warmthTimer = new() { Interval = TimeSpan.FromMilliseconds(150) };
+    readonly System.Windows.Threading.DispatcherTimer displayTimer = new() { Interval = TimeSpan.FromSeconds(2) };
+    readonly List<W.UIElement> displayControls = new();
     readonly TaskCompletionSource hardwareReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public Task HardwareReady => hardwareReady.Task;
     readonly NotifyIcon tray;
@@ -34,11 +36,13 @@ internal partial class FluentWindow : W.Window
     bool keyPolling;
     bool polling, exiting, updating;
     bool performanceSelectionDirty, graphicsSelectionDirty;
+    bool displaysInitialized;
     int ticks;
     DisplayTarget Display => displays.SelectedItem as DisplayTarget ?? throw new IOException("No display available.");
     public FluentWindow()
     {
         InitializeComponent();
+        SourceInitialized += (_, _) => ApplyPalette();
         ApplyPalette(); SystemEvents.UserPreferenceChanged += ThemeChanged;
         live = new(lighting); live.Failed += ex => Dispatcher.BeginInvoke(() => Status(L.Error(ex), true));
         string[] ids = ["monitor", "lighting", "display", "shortcuts", "settings"], icons = ["\uE9D9", "\uE781", "\uE7F4", "\uE765", "\uE713"];
@@ -57,15 +61,42 @@ internal partial class FluentWindow : W.Window
         menu.Opened += (_, _) => { if (W.PresentationSource.FromVisual(menu) is System.Windows.Interop.HwndSource source) SetForegroundWindow(source.Handle); };
         tray = new() { Icon = LoadTrayIcon(), Text = "SukaControl", Visible = true }; tray.DoubleClick += (_, _) => Dispatcher.BeginInvoke(Restore);
         tray.MouseUp += (_, e) => { if (e.Button == MouseButtons.Right) Dispatcher.BeginInvoke(() => menu.IsOpen = true); };
-        Loaded += async (_, _) => { await InitializeHardware(); timer.Start(); keyTimer.Start(); };
+        SystemEvents.DisplaySettingsChanged += DisplaysChanged;
+        displayTimer.Tick += (_, _) => RefreshDisplays();
+        Loaded += async (_, _) => { ApplyPalette(); displayTimer.Start(); await InitializeHardware(); timer.Start(); keyTimer.Start(); };
         timer.Tick += async (_, _) => await Poll();
         keyTimer.Tick += async (_, _) => await PollKeys();
         warmthTimer.Tick += async (_, _) => { warmthTimer.Stop(); preferences.Save(); if (eyeSwitch?.IsChecked == true) await Execute(() => { displayControl.Eye(Display, true, preferences.Warmth); return Task.CompletedTask; }); };
         Closing += (_, e) => { if (!exiting) { e.Cancel = true; Hide(); } };
-        Closed += (_, _) => { timer.Stop(); keyTimer.Stop(); warmthTimer.Stop(); menu.IsOpen = false; var icon = tray.Icon; tray.Dispose(); icon?.Dispose(); displayControl.Dispose(); firmware.Dispose(); SystemEvents.UserPreferenceChanged -= ThemeChanged; };
+        Closed += (_, _) => { timer.Stop(); keyTimer.Stop(); warmthTimer.Stop(); displayTimer.Stop(); menu.IsOpen = false; var icon = tray.Icon; tray.Dispose(); icon?.Dispose(); displayControl.Dispose(); firmware.Dispose(); SystemEvents.UserPreferenceChanged -= ThemeChanged; SystemEvents.DisplaySettingsChanged -= DisplaysChanged; };
         Activated += async (_, _) => { if (hardwareReady.Task.IsCompleted) await UpdateModes(); };
     }
     void ThemeChanged(object sender, UserPreferenceChangedEventArgs e) => Dispatcher.BeginInvoke(ApplyPalette);
+    void DisplaysChanged(object? sender, EventArgs e)
+    {
+        if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(() => { if (!exiting) RefreshDisplays(); });
+    }
+    void RefreshDisplays()
+    {
+        if (exiting) return;
+        try
+        {
+            var connected = DisplayControl.Displays();
+            if (displaysInitialized && displays.Items.Cast<DisplayTarget>().SequenceEqual(connected)) return;
+            var previous = displays.SelectedItem as DisplayTarget;
+            var selected = connected.FirstOrDefault(d => previous != null && d.DeviceId.Equals(previous.DeviceId, StringComparison.OrdinalIgnoreCase)) ?? connected.FirstOrDefault();
+            displayControl.ReconcileDisplays(connected);
+            warmthTimer.Stop();
+            displays.ItemsSource = connected;
+            displays.SelectedItem = selected;
+            displaysInitialized = true;
+            displays.IsEnabled = connected.Count > 0;
+            foreach (var control in displayControls) control.IsEnabled = selected != null;
+            if (eyeSwitch != null && (selected == null || selected.DeviceId != previous?.DeviceId)) eyeSwitch.IsChecked = false;
+            UpdateProfile();
+        }
+        catch (Exception ex) { Store.Log("Display refresh: " + ex.Message); }
+    }
     static System.Drawing.Icon LoadTrayIcon()
     {
         using var theme = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
@@ -78,6 +109,14 @@ internal partial class FluentWindow : W.Window
     {
         using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"); bool light = key?.GetValue("AppsUseLightTheme") is int n && n != 0;
         M.SolidColorBrush Brush(string color) => new((M.Color)M.ColorConverter.ConvertFromString(color));
+        var handle = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (handle != IntPtr.Zero)
+        {
+            int darkMode = light ? 0 : 1, backdrop = 2, defaultCaption = -1;
+            DwmSetWindowAttribute(handle, 20, ref darkMode, sizeof(int));
+            DwmSetWindowAttribute(handle, 35, ref defaultCaption, sizeof(int));
+            DwmSetWindowAttribute(handle, 38, ref backdrop, sizeof(int)); // Windows Settings uses the Mica backdrop.
+        }
         Resources["MainText"] = Brush(light ? "#1A1A1A" : "#F5F5F5"); Resources["MutedText"] = Brush(light ? "#646464" : "#AEAEAE"); Resources["CardSurface"] = Brush(light ? "#CCFFFFFF" : "#C92C2C2C"); Resources["CardStroke"] = Brush(light ? "#0F000000" : "#19000000"); Resources["HoverSurface"] = Brush(light ? "#08000000" : "#0FFFFFFF"); Resources["SelectedSurface"] = Brush(light ? "#0D000000" : "#12FFFFFF"); Resources["Accent"] = W.SystemColors.AccentColorBrush;
         if (tray != null) { var previous = tray.Icon; tray.Icon = LoadTrayIcon(); previous?.Dispose(); }
     }
@@ -168,7 +207,7 @@ internal partial class FluentWindow : W.Window
     }
     void BuildDisplay()
     {
-        var page = Page("display"); displays.Width = 350; displays.MinHeight = 34; foreach (var display in DisplayControl.Displays()) displays.Items.Add(display); if (displays.Items.Count > 0) displays.SelectedIndex = 0;
+        var page = Page("display"); displays.Width = 350; displays.MinHeight = 34;
         displays.SelectionChanged += (_, _) => UpdateProfile(); page.Children.Add(Setting("displayTarget", null, displays));
         eyeSwitch = Switch("eye", false, on => { displayControl.Eye(Display, on, preferences.Warmth); return Task.CompletedTask; }); page.Children.Add(Setting("eye", "eyeDescription", eyeSwitch));
         var warmth = new C.Slider { Minimum = 0, Maximum = 100, Value = preferences.Warmth, Width = 300, TickFrequency = 10, VerticalAlignment = W.VerticalAlignment.Center };
@@ -177,7 +216,8 @@ internal partial class FluentWindow : W.Window
         Section(page, "profiles"); var panel = new C.StackPanel(); profileChoice.Width = 420; profileChoice.HorizontalAlignment = W.HorizontalAlignment.Left;
         foreach (var path in DisplayControl.Profiles()) profileChoice.Items.Add(new Profile(path)); if (profileChoice.Items.Count > 0) profileChoice.SelectedIndex = 0;
         panel.Children.Add(profileChoice); profileText.Margin = new(0, 12, 0, 16); profileText.TextWrapping = W.TextWrapping.Wrap; profileText.SetResourceReference(C.TextBlock.ForegroundProperty, "MutedText"); panel.Children.Add(profileText);
-        panel.Children.Add(Horizontal(Button("apply", () => { var display = Display; RememberProfile(display); displayControl.Dispose(); eyeSwitch.IsChecked = false; DisplayControl.ApplyProfile(display, ((Profile)profileChoice.SelectedItem).Path); UpdateProfile(); }), Button("restore", () => { if (preferences.ColorBackups.TryGetValue(Display.DeviceId, out var snapshot)) snapshot.Restore(); else if (preferences.OriginalProfiles.TryGetValue(Display.DeviceId, out var profile) && !string.IsNullOrEmpty(profile)) DisplayControl.ApplyProfile(Display, ProfilePath(profile)); else throw new InvalidOperationException(L.T("noOriginalProfile")); UpdateProfile(); }), Button("systemColor", () => Process.Start(new ProcessStartInfo("colorcpl.exe") { UseShellExecute = true })))); page.Children.Add(Card(panel, 20)); UpdateProfile();
+        panel.Children.Add(Horizontal(Button("apply", () => { var display = Display; RememberProfile(display); displayControl.Dispose(); eyeSwitch.IsChecked = false; DisplayControl.ApplyProfile(display, ((Profile)profileChoice.SelectedItem).Path); UpdateProfile(); }), Button("restore", () => { if (preferences.ColorBackups.TryGetValue(Display.DeviceId, out var snapshot)) snapshot.Restore(); else if (preferences.OriginalProfiles.TryGetValue(Display.DeviceId, out var profile) && !string.IsNullOrEmpty(profile)) DisplayControl.ApplyProfile(Display, ProfilePath(profile)); else throw new InvalidOperationException(L.T("noOriginalProfile")); UpdateProfile(); }), Button("systemColor", () => Process.Start(new ProcessStartInfo("colorcpl.exe") { UseShellExecute = true })))); page.Children.Add(Card(panel, 20));
+        displayControls.AddRange([eyeSwitch, warmth, panel]); RefreshDisplays();
     }
     void BuildShortcuts()
     {
@@ -198,7 +238,7 @@ internal partial class FluentWindow : W.Window
         var actions = Horizontal(Button("refresh", InitializeHardware), Button("diagnostics", async () => { string path = await Diagnostics.Write(); Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true }); }), Button("logs", () => Process.Start(new ProcessStartInfo(Store.Root) { UseShellExecute = true }))); actions.Margin = new(0, 12, 0, 12); page.Children.Add(actions);
         if (!HardwareClient.Installed) page.Children.Add(Setting("installService", "serviceNote", Button("installService", async () => { var process = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--install-service --owner-sid " + System.Security.Principal.WindowsIdentity.GetCurrent().User!.Value) { UseShellExecute = true, Verb = "runas" }); if (process != null) await process.WaitForExitAsync(); if (!HardwareClient.Installed) throw new IOException("Service install failed."); await InitializeHardware(); })));
         Section(page, "about");
-        var about = new C.StackPanel(); about.Children.Add(Text("SukaControl 0.2.2"));
+        var about = new C.StackPanel(); about.Children.Add(Text("SukaControl 0.2.3"));
         var author = new System.Windows.Documents.Hyperlink(new System.Windows.Documents.Run("SuzukiNatsume")) { NavigateUri = new Uri("https://github.com/SuzukiNatsume") };
         author.RequestNavigate += (_, e) => { Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true }); e.Handled = true; };
         var link = Text(""); link.Margin = new(0, 8, 0, 0); link.Inlines.Add(author); about.Children.Add(link); page.Children.Add(Card(about));
@@ -302,10 +342,11 @@ internal partial class FluentWindow : W.Window
         return result;
     }
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr window, int attribute, ref int value, int size);
     void ToggleEye() { displayControl.Eye(Display, !displayControl.EyeEnabled, preferences.Warmth); if (eyeSwitch != null) eyeSwitch.IsChecked = displayControl.EyeEnabled; }
     void RememberProfile(DisplayTarget display) { if (!preferences.ColorBackups.ContainsKey(display.DeviceId)) preferences.ColorBackups[display.DeviceId] = ColorSnapshot.Capture(display); if (!preferences.OriginalProfiles.ContainsKey(display.DeviceId)) preferences.OriginalProfiles[display.DeviceId] = DisplayControl.CurrentProfile(display); preferences.Save(); }
     static string ProfilePath(string profile) => Path.IsPathRooted(profile) ? profile : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "spool", "drivers", "color", profile);
-    void UpdateProfile() { if (displays.SelectedItem is DisplayTarget display) profileText.Text = L.F("currentProfile", DisplayControl.CurrentProfile(display) is { Length: > 0 } p ? p : L.T("systemDefault")); }
+    void UpdateProfile() { profileText.Text = displays.SelectedItem is DisplayTarget display ? L.F("currentProfile", DisplayControl.CurrentProfile(display) is { Length: > 0 } p ? p : L.T("systemDefault")) : L.T("unavailable"); }
     void Restart() { if (W.MessageBox.Show(this, L.T("restartConfirm"), L.T("restart"), W.MessageBoxButton.YesNo, W.MessageBoxImage.Question) == W.MessageBoxResult.Yes) Process.Start(new ProcessStartInfo("shutdown.exe", "/r /t 0") { UseShellExecute = false, CreateNoWindow = true }); }
     public void Restore() { Show(); WindowState = W.WindowState.Normal; Activate(); }
     internal void SelectPage(string id) { foreach (C.ListBoxItem item in Navigation.Items) if ((string)item.Tag == id) { Navigation.SelectedItem = item; break; } }

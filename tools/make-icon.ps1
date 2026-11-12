@@ -47,9 +47,9 @@ foreach($theme in 'Dark','Light') {
     foreach($size in $traySizes) {
         $bitmap=New-Object Drawing.Bitmap($size,$size);$graphics=[Drawing.Graphics]::FromImage($bitmap)
         $graphics.SmoothingMode='AntiAlias';$graphics.PixelOffsetMode='HighQuality';$graphics.ScaleTransform($size/16.0,$size/16.0)
-        $pen=New-Object Drawing.Pen($color,1.15);$pen.StartCap='Round';$pen.EndCap='Round';$brush=New-Object Drawing.SolidBrush($color)
-        foreach($x in 4,8,12){$graphics.DrawLine($pen,[single]$x,[single]2.5,[single]$x,[single]13.5)}
-        foreach($point in @(@(4,6),@(8,10),@(12,7))) {$graphics.FillEllipse($brush,[single]($point[0]-1.75),[single]($point[1]-1.75),[single]3.5,[single]3.5)}
+        $pen=New-Object Drawing.Pen($color,1.3);$pen.StartCap='Round';$pen.EndCap='Round';$brush=New-Object Drawing.SolidBrush($color)
+        foreach($x in 3,8,13){$graphics.DrawLine($pen,[single]$x,[single]1.5,[single]$x,[single]14.5)}
+        foreach($point in @(@(3,6),@(8,10),@(13,7))) {$graphics.FillEllipse($brush,[single]($point[0]-2),[single]($point[1]-2),[single]4,[single]4)}
         if($size -eq 64){$bitmap.Save((Join-Path $assetRoot "Tray$theme-preview.png"),[Drawing.Imaging.ImageFormat]::Png)}
         $stream=New-Object IO.MemoryStream;$bitmap.Save($stream,[Drawing.Imaging.ImageFormat]::Png);$trayFrames.Add($stream.ToArray())
         $stream.Dispose();$brush.Dispose();$pen.Dispose();$graphics.Dispose();$bitmap.Dispose()
