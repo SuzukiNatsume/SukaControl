@@ -37,6 +37,7 @@ internal partial class FluentWindow : W.Window
     bool polling, exiting, updating;
     bool performanceSelectionDirty, graphicsSelectionDirty;
     bool displaysInitialized;
+    bool initialized;
     int ticks;
     DisplayTarget Display => displays.SelectedItem as DisplayTarget ?? throw new IOException("No display available.");
     public FluentWindow()
@@ -63,13 +64,25 @@ internal partial class FluentWindow : W.Window
         tray.MouseUp += (_, e) => { if (e.Button == MouseButtons.Right) Dispatcher.BeginInvoke(() => menu.IsOpen = true); };
         SystemEvents.DisplaySettingsChanged += DisplaysChanged;
         displayTimer.Tick += (_, _) => RefreshDisplays();
-        Loaded += async (_, _) => { ApplyPalette(); displayTimer.Start(); await InitializeHardware(); timer.Start(); keyTimer.Start(); };
+        Loaded += async (_, _) => await InitializeOnce();
         timer.Tick += async (_, _) => await Poll();
         keyTimer.Tick += async (_, _) => await PollKeys();
         warmthTimer.Tick += async (_, _) => { warmthTimer.Stop(); preferences.Save(); if (eyeSwitch?.IsChecked == true) await Execute(() => { displayControl.Eye(Display, true, preferences.Warmth); return Task.CompletedTask; }); };
         Closing += (_, e) => { if (!exiting) { e.Cancel = true; Hide(); } };
         Closed += (_, _) => { timer.Stop(); keyTimer.Stop(); warmthTimer.Stop(); displayTimer.Stop(); menu.IsOpen = false; var icon = tray.Icon; tray.Dispose(); icon?.Dispose(); displayControl.Dispose(); firmware.Dispose(); SystemEvents.UserPreferenceChanged -= ThemeChanged; SystemEvents.DisplaySettingsChanged -= DisplaysChanged; };
         Activated += async (_, _) => { if (hardwareReady.Task.IsCompleted) await UpdateModes(); };
+    }
+    async Task InitializeOnce()
+    {
+        if (initialized) return;
+        initialized = true;
+        ApplyPalette(); displayTimer.Start(); await InitializeHardware(); timer.Start(); keyTimer.Start();
+    }
+    internal void StartInTray()
+    {
+        ShowActivated = false;
+        new System.Windows.Interop.WindowInteropHelper(this).EnsureHandle();
+        Dispatcher.BeginInvoke(async () => await InitializeOnce());
     }
     void ThemeChanged(object sender, UserPreferenceChangedEventArgs e) => Dispatcher.BeginInvoke(ApplyPalette);
     void DisplaysChanged(object? sender, EventArgs e)
@@ -238,7 +251,7 @@ internal partial class FluentWindow : W.Window
         var actions = Horizontal(Button("refresh", InitializeHardware), Button("diagnostics", async () => { string path = await Diagnostics.Write(); Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true }); }), Button("logs", () => Process.Start(new ProcessStartInfo(Store.Root) { UseShellExecute = true }))); actions.Margin = new(0, 12, 0, 12); page.Children.Add(actions);
         if (!HardwareClient.Installed) page.Children.Add(Setting("installService", "serviceNote", Button("installService", async () => { var process = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--install-service --owner-sid " + System.Security.Principal.WindowsIdentity.GetCurrent().User!.Value) { UseShellExecute = true, Verb = "runas" }); if (process != null) await process.WaitForExitAsync(); if (!HardwareClient.Installed) throw new IOException("Service install failed."); await InitializeHardware(); })));
         Section(page, "about");
-        var about = new C.StackPanel(); about.Children.Add(Text("SukaControl 0.2.3"));
+        var about = new C.StackPanel(); about.Children.Add(Text("SukaControl 0.2.4"));
         var author = new System.Windows.Documents.Hyperlink(new System.Windows.Documents.Run("SuzukiNatsume")) { NavigateUri = new Uri("https://github.com/SuzukiNatsume") };
         author.RequestNavigate += (_, e) => { Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true }); e.Handled = true; };
         var link = Text(""); link.Margin = new(0, 8, 0, 0); link.Inlines.Add(author); about.Children.Add(link); page.Children.Add(Card(about));

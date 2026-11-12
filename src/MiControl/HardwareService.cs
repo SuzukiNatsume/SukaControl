@@ -59,9 +59,13 @@ internal sealed class ControlService : ServiceBase
 {
     readonly CancellationTokenSource stop = new();
     Task? worker;
-    public ControlService() { ServiceName = "SukaService"; CanStop = true; AutoLog = false; }
+    readonly object lifecycleGate = new();
+    PerformanceMemory? performanceMemory;
+    public ControlService() { ServiceName = "SukaService"; CanStop = true; CanShutdown = true; AutoLog = false; }
     protected override void OnStart(string[] args) { worker = Task.Run(() => Serve(stop.Token)); }
-    protected override void OnStop() { stop.Cancel(); worker?.Wait(TimeSpan.FromSeconds(5)); }
+    void CapturePerformance() { lock (lifecycleGate) performanceMemory?.Finish(); }
+    protected override void OnShutdown() { CapturePerformance(); stop.Cancel(); worker?.Wait(TimeSpan.FromSeconds(5)); base.OnShutdown(); }
+    protected override void OnStop() { CapturePerformance(); stop.Cancel(); worker?.Wait(TimeSpan.FromSeconds(5)); }
     async Task Serve(CancellationToken token)
     {
         try
@@ -72,6 +76,11 @@ internal sealed class ControlService : ServiceBase
             acl.AddAccessRule(new(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), PipeAccessRights.FullControl, AccessControlType.Allow));
             acl.AddAccessRule(new(ownerSid, PipeAccessRights.ReadWrite, AccessControlType.Allow));
             using var firmware = new Firmware(false); firmware.Connect();
+            var memory = new PerformanceMemory(Path.Combine(ServiceInstaller.DataDirectory, "performance-state.json"), firmware.Performance, firmware.SetPerformance, Store.Log);
+            memory.Restore();
+            lock (lifecycleGate) performanceMemory = memory;
+            try
+            {
             var lighting = new Lighting(false);
             using var keys = new KeyService(firmware, lighting, owner);
             while (!token.IsCancellationRequested)
@@ -89,6 +98,7 @@ internal sealed class ControlService : ServiceBase
                         if (request.Command is 0x40 or 0x41)
                         {
                             var state = await keys.Read(request.Command == 0x41, request.Ack);
+                            memory.Remember(state.State.PerformanceMode);
                             reply = new(true, null, firmware.Model, Keys: state.State, Action: state.Action);
                         }
                         else if (request.Command == 0x50)
@@ -101,7 +111,7 @@ internal sealed class ControlService : ServiceBase
                         {
                             byte[]? data = request.Command == 0 ? null : firmware.Call(request.Command, request.Write, request.Value, request.Value2);
                             if (request.Write && request.Command == 10) keys.InvalidateState();
-                            if (request.Write && request.Command == 8) keys.InvalidatePerformance();
+                            if (request.Write && request.Command == 8) { keys.InvalidatePerformance(); memory.Capture(); }
                             reply = new(true, data, firmware.Model);
                         }
                     }
@@ -111,6 +121,8 @@ internal sealed class ControlService : ServiceBase
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
                 catch (Exception ex) { Store.Log("Hardware pipe: " + ex); }
             }
+            }
+            finally { lock (lifecycleGate) performanceMemory = null; }
         }
         catch (Exception ex) { Store.Log("Hardware service: " + ex); Environment.ExitCode = 1; }
     }
@@ -231,7 +243,7 @@ internal static class ServiceInstaller
         if (ping?.Ok != true) throw new IOException("SukaService did not become ready.");
         using (var key = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SukaControl"))
         {
-            key.SetValue("DisplayName", "SukaControl"); key.SetValue("DisplayVersion", "0.2.3"); key.SetValue("Publisher", "SuzukiNatsume"); key.SetValue("InstallLocation", target); key.SetValue("DisplayIcon", executable); key.SetValue("UninstallString", $"\"{executable}\" --uninstall"); key.SetValue("QuietUninstallString", $"\"{executable}\" --uninstall --quiet"); key.SetValue("NoModify", 1); key.SetValue("NoRepair", 1);
+            key.SetValue("DisplayName", "SukaControl"); key.SetValue("DisplayVersion", "0.2.4"); key.SetValue("Publisher", "SuzukiNatsume"); key.SetValue("InstallLocation", target); key.SetValue("DisplayIcon", executable); key.SetValue("UninstallString", $"\"{executable}\" --uninstall"); key.SetValue("QuietUninstallString", $"\"{executable}\" --uninstall --quiet"); key.SetValue("NoModify", 1); key.SetValue("NoRepair", 1);
         }
         CreateShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), "SukaControl.lnk"), executable);
         LegacyMigration.Complete(owner.Value);
