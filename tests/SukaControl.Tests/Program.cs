@@ -65,6 +65,8 @@ try
     Test("audio-PCM24-sign-extension", p => Assert(AudioSampleDecoder.ReadFrame([0, 0, 128], 24, false) == -1f && AudioSampleDecoder.ReadFrame([0, 0, 64], 24, false) == .5f));
     Test("audio-float-handles-invalid-channel", p => { var values = BitConverter.GetBytes(float.NaN).Concat(BitConverter.GetBytes(.25f)).ToArray(); Assert(AudioSampleDecoder.ReadFrame(values, 32, true) == .25f); });
     Test("audio-PCM8-midpoint-is-silence", p => Assert(AudioSampleDecoder.ReadFrame([128], 8, false) == 0));
+    Test("lighting-delayed-readback-is-confirmed", p => { int reads = 0; var result = Lighting.Confirm(() => Task.FromResult(new byte[] { (byte)(++reads < 3 ? 1 : 3) }), state => state[0] == 3, "failed", 4, 0).GetAwaiter().GetResult(); Assert(result[0] == 3 && reads == 3); });
+    Test("lighting-readback-retry-is-bounded", p => { int reads = 0; bool failed = false; try { Lighting.Confirm(() => { reads++; return Task.FromResult(new byte[] { 1 }); }, state => state[0] == 3, "failed", 3, 0).GetAwaiter().GetResult(); } catch (IOException) { failed = true; } Assert(failed && reads == 3); });
     Console.WriteLine($"{passed} performance, lighting and audio tests passed");
 }
 

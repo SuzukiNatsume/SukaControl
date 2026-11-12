@@ -80,6 +80,15 @@ internal sealed class Lighting(bool allowRemote = true) : ILighting
     }
     public Task<byte[]> ReadConfig() => Exchange(1);
     public Task<byte[]> ReadKeyboard() => ReadConfig();
+    internal static async Task<byte[]> Confirm(Func<Task<byte[]>> read, Func<byte[], bool> matches, string error, int attempts = 10, int delay = 60)
+    {
+        for (int i = 0; i < attempts; i++)
+        {
+            var actual = await read(); if (matches(actual)) return actual;
+            if (i + 1 < attempts) await Task.Delay(delay);
+        }
+        throw new IOException(error);
+    }
     // This is the OEM common-settings selector, not the flash-save operation (command 0x05).
     internal const byte NormalSettings = 1;
     internal const byte DirectSettings = 0;
@@ -102,8 +111,7 @@ internal sealed class Lighting(bool allowRemote = true) : ILighting
         p[2] = 0; p[3] = (byte)Math.Clamp(direction, 0, 1); p[4] = (byte)Math.Clamp(brightness, 0, 3); p[5] = (byte)Math.Clamp(speed, 1, 4); p[7] = 0; p[8] = (byte)(config[12] | 2);
         if (effect == 9) { p[2] = 0xff; p[14] = (byte)(color.R / 2); p[15] = (byte)(color.G / 2); p[16] = (byte)(color.B / 2); }
         await Exchange(2, p);
-        var state = await ReadKeyboard();
-        if (state[5] != p[1] || state[8] != p[4]) throw new IOException("灯效已发送，但键盘效果或亮度回读不一致。");
+        await Confirm(ReadKeyboard, state => state[5] == p[1] && state[8] == p[4], "灯效已发送，但键盘效果或亮度回读不一致。");
     }
     public async Task Accent(bool logo, byte effect, Color color)
     {
@@ -114,12 +122,11 @@ internal sealed class Lighting(bool allowRemote = true) : ILighting
         config[8] = logo ? (byte)((config[8] & 0x3f) | (effect == 4 ? 0 : effect == 5 ? 0x80 : 0x40)) : (byte)(effect == 4 ? config[8] & ~4 : config[8] | 4);
         config[8] |= logo ? (byte)0x10 : (byte)0x20;
         await Exchange(2, config);
-        if (effect is 4 or 5) { var verify = await ReadConfig(); if (verify[12] != config[8]) throw new IOException("灯区联动回读不一致。"); return; }
+        if (effect is 4 or 5) { await Confirm(ReadConfig, state => state[12] == config[8], "灯区联动回读不一致。"); return; }
         await Exchange(0xd, logo ? (byte)0 : (byte)1, effect == 9 ? (byte)1 : effect, effect is 9 or 2 ? (byte)0xff : (byte)0);
         byte[] rgb = logo ? new byte[] { 0, 0, 0x7f, color.R, color.G, color.B } : new byte[] { 1, 0, 0x7f, color.R, color.G, color.B, 1, 0x7f, color.R, color.G, color.B, 2, 0x7f, color.R, color.G, color.B };
         await Exchange(0xb, rgb);
-        var result = await Exchange(0xc, logo ? (byte)0 : (byte)1);
-        if (result[5] != (effect == 9 ? 1 : effect)) throw new IOException("灯区模式回读不一致。");
+        await Confirm(() => Exchange(0xc, logo ? (byte)0 : (byte)1), state => state[5] == (effect == 9 ? 1 : effect), "灯区模式回读不一致。");
     }
 
     public async Task Enable(int area, bool enabled)
@@ -127,8 +134,8 @@ internal sealed class Lighting(bool allowRemote = true) : ILighting
         byte bit = area switch { 0 => 2, 1 => 0x10, 2 => 0x20, _ => throw new ArgumentOutOfRangeException(nameof(area)) };
         var current = await ReadConfig(); var payload = SettingsPayload(current, true);
         payload[8] = enabled ? (byte)(payload[8] | bit) : (byte)(payload[8] & ~bit);
-        await Exchange(2, payload); var after = await ReadConfig();
-        if (((after[12] & bit) != 0) != enabled) throw new IOException("灯区开关回读不一致。");
+        await Exchange(2, payload);
+        await Confirm(ReadConfig, state => ((state[12] & bit) != 0) == enabled, "灯区开关回读不一致。");
     }
     public async Task Save()
     {

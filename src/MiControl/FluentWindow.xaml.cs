@@ -220,9 +220,9 @@ internal partial class FluentWindow : W.Window
             lightApplyButtons.Add(apply);
             var dirty = new HashSet<string>(); bool built = false;
             clearLightingDrafts.Add(dirty.Clear);
-            void Changed(string field) { if (built && !updating) { dirty.Add(field); apply.IsEnabled = true; Status(L.T("lightingParametersChanged")); } }
+            void Changed(string field) { if (built && !updating) { dirty.Add(field); apply.IsEnabled = lightSwitches[index].IsChecked == true; Status(L.T("lightingParametersChanged")); } }
             var panel = new C.StackPanel(); var titleRow = new C.DockPanel();
-            var enable = Switch(id, true, on => LightingOperation(async () => { if (index == 0) { await softwareLighting.Stop(); activeSoftwareLighting = null; keyboardPreviewChanged = true; } await lightingSession.Apply(() => lighting.Enable(index, on)); saveLightingButton.IsEnabled = lightingSession.Pending; }), "lightingPreviewApplied");
+            var enable = Switch(id, true, on => LightingOperation(async () => { if (index == 0) { await softwareLighting.Stop(); activeSoftwareLighting = null; keyboardPreviewChanged = true; } await lightingSession.Apply(() => lighting.Enable(index, on)); saveLightingButton.IsEnabled = lightingSession.Pending; apply.IsEnabled = on; }), "lightingPreviewApplied");
             lightSwitches.Add(enable); C.DockPanel.SetDock(enable, C.Dock.Right); titleRow.Children.Add(enable); var title = Text(L.T(id), 16); title.FontWeight = W.FontWeights.SemiBold; titleRow.Children.Add(title); panel.Children.Add(titleRow);
             var choices = area == 0 ? new[] { new LightEffect("screenSync", -1), new LightEffect("audioSync", -2), new LightEffect("soft", -3), new LightEffect("rainbow", 7), new LightEffect("trigger", 5), new LightEffect("wavelet", 3), new LightEffect("colorwave", 6), new LightEffect("firefly", 10), new LightEffect("snake", 8), new LightEffect("wave", 1), new LightEffect("breath", 2), new LightEffect("keep", 9) } : area == 1 ? new[] { new LightEffect("keep", 9), new LightEffect("breath", 2), new LightEffect("gradient", 3), new LightEffect("linked", 4), new LightEffect("linkedBar", 5) } : new[] { new LightEffect("keep", 9), new LightEffect("breath", 2), new LightEffect("gradient", 3), new LightEffect("linked", 4) };
             var effect = Choice(choices, 210); effect.SelectedIndex = area == 0 ? choices.Length - 1 : 0;
@@ -252,6 +252,7 @@ internal partial class FluentWindow : W.Window
             }
             apply.Click += async (_, _) =>
             {
+                if (enable.IsChecked != true) return;
                 apply.IsEnabled = false;
                 bool ok = await Execute(() => LightingOperation(async () =>
                 {
@@ -266,12 +267,12 @@ internal partial class FluentWindow : W.Window
                     saveLightingButton.IsEnabled = lightingSession.Pending;
                     dirty.Clear();
                 }), "lightingPreviewApplied");
-                if (!ok) apply.IsEnabled = true;
+                if (!ok) apply.IsEnabled = enable.IsChecked == true;
             };
             var actions = Horizontal(apply); actions.HorizontalAlignment = W.HorizontalAlignment.Right; actions.Margin = new(0, 16, 0, 0); panel.Children.Add(actions); page.Children.Add(Card(panel, 20));
             lightingBindings.Add(state =>
             {
-                var config = state.Config; var preset = index == 0 && softwareLighting.Running ? activeSoftwareLighting : null;
+                var config = state.Config; var preset = index == 0 ? activeSoftwareLighting : null;
                 int code; Color actualColor;
                 if (index == 0)
                 {
@@ -293,7 +294,10 @@ internal partial class FluentWindow : W.Window
                 }
                 if (!dirty.Contains("effect")) effect.SelectedItem = choices.FirstOrDefault(choice => choice.Code == code);
                 if (!dirty.Contains("color")) { color = actualColor; ColorLabel(); }
+                bool previouslyEnabled = enable.IsChecked == true;
                 enable.IsChecked = (config[12] & new[] { 2, 16, 32 }[index]) != 0;
+                if (enable.IsChecked != true) apply.IsEnabled = false;
+                else if (!previouslyEnabled) apply.IsEnabled = true;
                 int selectedCode = (effect.SelectedItem as LightEffect)?.Code ?? 0;
                 colorButton.IsEnabled = index == 0 ? selectedCode is 9 or -1 or -2 or -3 : selectedCode is 9 or 2;
                 speed.IsEnabled = selectedCode is not (9 or -1); direction.IsEnabled = selectedCode > 0 && selectedCode != 9;
@@ -315,15 +319,24 @@ internal partial class FluentWindow : W.Window
     async Task SaveLighting()
     {
         var preset = activeSoftwareLighting;
-        await softwareLighting.Stop();
-        if (preset != null) await lighting.Keyboard(9, Math.Clamp(preset.Brightness, 0, 3), Math.Clamp(preset.Speed, 1, 4), Color.FromArgb(preset.Argb));
-        await lightingSession.Save();
-        if (keyboardPreviewChanged || preset != null) preferences.SoftwareLighting = preset;
-        preferences.Save(); keyboardPreviewChanged = false; saveLightingButton!.IsEnabled = false;
-        foreach (var clear in clearLightingDrafts) clear();
-        foreach (var button in lightApplyButtons) button.IsEnabled = true;
-        if (preset != null) await StartSoftwareLighting(preset);
+        try
+        {
+            await softwareLighting.Stop();
+            // Stop restores the last actual hardware effect. Persist that valid
+            // boot fallback; software parameters are saved separately below.
+            await lightingSession.Save();
+            if (keyboardPreviewChanged || preset != null) preferences.SoftwareLighting = preset;
+            preferences.Save(); keyboardPreviewChanged = false; saveLightingButton!.IsEnabled = false;
+            foreach (var clear in clearLightingDrafts) clear(); ResetLightApplyButtons();
+        }
+        finally
+        {
+            if (preset != null)
+                try { await StartSoftwareLighting(preset); activeSoftwareLighting = preset; }
+                catch { activeSoftwareLighting = null; throw; }
+        }
     }
+    void ResetLightApplyButtons() { for (int i = 0; i < lightApplyButtons.Count; i++) lightApplyButtons[i].IsEnabled = lightSwitches[i].IsChecked == true; }
     async Task ResumeSavedSoftwareLighting()
     {
         if (preferences.SoftwareLighting is not { Effect: "screenSync" or "audioSync" or "soft" } preset) return;
@@ -363,7 +376,7 @@ internal partial class FluentWindow : W.Window
         var actions = Horizontal(Button("refresh", InitializeHardware), Button("diagnostics", async () => { string path = await Diagnostics.Write(); Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true }); }), Button("logs", () => Process.Start(new ProcessStartInfo(Store.Root) { UseShellExecute = true }))); actions.Margin = new(0, 12, 0, 12); page.Children.Add(actions);
         if (!HardwareClient.Installed) page.Children.Add(Setting("installService", "serviceNote", Button("installService", async () => { var process = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--install-service --owner-sid " + System.Security.Principal.WindowsIdentity.GetCurrent().User!.Value) { UseShellExecute = true, Verb = "runas" }); if (process != null) await process.WaitForExitAsync(); if (!HardwareClient.Installed) throw new IOException("Service install failed."); await InitializeHardware(); })));
         Section(page, "about");
-        var about = new C.StackPanel(); about.Children.Add(Text("SukaControl 0.2.8"));
+        var about = new C.StackPanel(); about.Children.Add(Text("SukaControl 0.2.9"));
         var author = new System.Windows.Documents.Hyperlink(new System.Windows.Documents.Run("SuzukiNatsume")) { NavigateUri = new Uri("https://github.com/SuzukiNatsume") };
         author.RequestNavigate += (_, e) => { Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true }); e.Handled = true; };
         var link = Text(""); link.Margin = new(0, 8, 0, 0); link.Inlines.Add(author); about.Children.Add(link); page.Children.Add(Card(about));
@@ -508,7 +521,7 @@ internal partial class FluentWindow : W.Window
         await lightingSession.Revert();
         foreach (var clear in clearLightingDrafts) clear();
         if (saveLightingButton != null) saveLightingButton.IsEnabled = false;
-        foreach (var button in lightApplyButtons) button.IsEnabled = true;
+        ResetLightApplyButtons();
     });
     Task CancelTemporaryLighting() => LightingOperation(async () =>
     {
@@ -524,7 +537,7 @@ internal partial class FluentWindow : W.Window
         }
         foreach (var clear in clearLightingDrafts) clear();
         if (saveLightingButton != null) saveLightingButton.IsEnabled = false;
-        foreach (var button in lightApplyButtons) button.IsEnabled = true;
+        ResetLightApplyButtons();
     });
     internal async Task<Dictionary<string, object?>> TestLightingUI()
     {
@@ -563,6 +576,7 @@ internal partial class FluentWindow : W.Window
         {
             SelectPage("lighting");
             lightEffectChoices[0].SelectedItem = lightEffectChoices[0].Items.Cast<LightEffect>().Single(effect => effect.Id == "soft");
+            if (keyboardBrightness != null) keyboardBrightness.Value = 3;
             lightApplyButtons[0].RaiseEvent(new W.RoutedEventArgs(C.Button.ClickEvent));
             for (int i = 0; i < 100 && (softwareLighting.FramesWritten == 0 || !softwareLighting.Running || saveLightingButton?.IsEnabled != true); i++) await Task.Delay(50);
             if (!softwareLighting.Running || softwareLighting.FramesWritten == 0) throw new IOException("Soft glow preview did not start.");
@@ -572,6 +586,9 @@ internal partial class FluentWindow : W.Window
             for (int i = 0; i < 100 && (StatusText.Text != L.T("softwareLightingSaved") || !softwareLighting.Running); i++) await Task.Delay(50);
             if (preferences.SoftwareLighting?.Effect != "soft" || StatusText.Text != L.T("softwareLightingSaved")) throw new IOException("Software effect settings were not saved.");
             result["softwareParametersSaved"] = true;
+            for (int i = 0; i < 20; i++) { await PollKeys(); await Task.Delay(60); }
+            result["effectSelectionSurvivesReadback"] = (lightEffectChoices[0].SelectedItem as LightEffect)?.Id == "soft";
+            if (result["effectSelectionSurvivesReadback"] is not true) throw new IOException("Readback replaced the active software effect.");
             result["applyReenabledAfterSave"] = lightApplyButtons[0].IsEnabled;
             if (!lightApplyButtons[0].IsEnabled) throw new IOException("Save did not reenable Apply.");
             await CloseToTray();
@@ -632,12 +649,31 @@ internal partial class FluentWindow : W.Window
             for (int i = 0; i < 60 && (softwareLighting.AudioFramesReceived == 0 || softwareLighting.AudioPeak < .0001 || softwareLighting.LitKeys == 0); i++) await Task.Delay(50);
             result["audioFramesReceived"] = softwareLighting.AudioFramesReceived; result["audioPeak"] = softwareLighting.AudioPeak; result["litKeys"] = softwareLighting.LitKeys;
             result["controllerBrightness"] = (await lighting.ReadConfig())[8];
-            result["passed"] = softwareLighting.AudioFramesReceived > 0 && softwareLighting.AudioPeak >= .0001 && softwareLighting.LitKeys > 0;
+            for (int i = 0; i < 20; i++) { await PollKeys(); await Task.Delay(60); }
+            result["visualizerSelectionSurvivesReadback"] = (lightEffectChoices[0].SelectedItem as LightEffect)?.Id == "audioSync";
+            result["passed"] = softwareLighting.AudioFramesReceived > 0 && softwareLighting.AudioPeak >= .0001 && softwareLighting.LitKeys > 0 && result["visualizerSelectionSurvivesReadback"] is true;
             output.Stop(); await CloseToTray(); result["closeStopsAudio"] = !softwareLighting.Running;
         }
         catch (Exception ex) { result["passed"] = false; result["error"] = ex.ToString(); }
         finally { await RevertLighting(); await lighting.Exchange(2, Lighting.SettingsPayload(before, false)); preferences.SoftwareLighting = oldPreference; }
         return result;
+    }
+    internal Dictionary<string, object?> TestDisabledLightingUI()
+    {
+        bool previousUpdating = updating; bool passed = true; var results = new List<bool>();
+        try
+        {
+            for (int i = 0; i < lightSwitches.Count; i++)
+            {
+                bool? enabled = lightSwitches[i].IsChecked; object? selected = lightEffectChoices[i].SelectedItem;
+                lightSwitches[i].IsChecked = false; ResetLightApplyButtons();
+                lightEffectChoices[i].SelectedIndex = (lightEffectChoices[i].SelectedIndex + 1) % lightEffectChoices[i].Items.Count;
+                bool disabled = !lightApplyButtons[i].IsEnabled; results.Add(disabled); passed &= disabled;
+                updating = true; lightSwitches[i].IsChecked = enabled; lightEffectChoices[i].SelectedItem = selected; updating = previousUpdating;
+            }
+        }
+        finally { updating = previousUpdating; foreach (var clear in clearLightingDrafts) clear(); ResetLightApplyButtons(); }
+        return new() { ["passed"] = passed, ["disabledApplyForAllThreeAreas"] = results };
     }
     public async Task Exit(bool restoreColor = false) { exiting = true; IsEnabled = false; timer.Stop(); keyTimer.Stop(); warmthTimer.Stop(); try { await RevertLighting(); } catch (Exception ex) { Store.Log(ex.ToString()); } if (restoreColor) foreach (var snapshot in preferences.ColorBackups.Values) snapshot.Restore(); Close(); }
     async Task<bool> Execute(Func<Task> action, string? successMessage = null)
