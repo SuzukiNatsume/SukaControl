@@ -74,13 +74,24 @@ internal sealed class Lighting(bool allowRemote = true)
     }
     public Task<byte[]> ReadConfig() => Exchange(1);
     public Task<byte[]> ReadKeyboard() => ReadConfig();
+    internal const byte PersistentSettings = 1;
+    internal const byte TemporarySettings = 0;
+    internal static byte[] SettingsPayload(byte[] state, bool persistent)
+    {
+        if (state.Length < 64 || state[1] != 0x57 || state[2] != 0xab || state[3] != 1) throw new ArgumentException("Invalid lighting configuration.");
+        var payload = state.Skip(4).Take(60).ToArray();
+        // A software-driven per-pixel mode cannot run before the desktop is available.
+        payload[0] = persistent && payload[1] != 0xff ? PersistentSettings : TemporarySettings;
+        return payload;
+    }
 
     public async Task Keyboard(byte effect, int brightness, int speed, Color color, int direction = 1)
     {
         if (effect is not (1 or 2 or 3 or 4 or 5 or 6 or 7 or 8 or 9 or 10)) throw new ArgumentOutOfRangeException(nameof(effect));
         var config = await ReadConfig();
         // B21 common-setting encoder (OEM 2.1.1.413, 0x180192d80).
-        var p = new byte[60]; p[0] = 0; p[1] = effect == 9 ? (byte)11 : effect;
+        // Match the OEM B21 CommonSetting encoder: ordinary settings use report[4] = 1.
+        var p = new byte[60]; p[0] = PersistentSettings; p[1] = effect == 9 ? (byte)11 : effect;
         p[2] = 0; p[3] = (byte)Math.Clamp(direction, 0, 1); p[4] = (byte)Math.Clamp(brightness, 0, 3); p[5] = (byte)Math.Clamp(speed, 1, 4); p[7] = 0; p[8] = (byte)(config[12] | 2);
         if (effect == 9) { p[2] = 0xff; p[14] = (byte)(color.R / 2); p[15] = (byte)(color.G / 2); p[16] = (byte)(color.B / 2); }
         await Exchange(2, p);
@@ -91,10 +102,10 @@ internal sealed class Lighting(bool allowRemote = true)
     {
         if (effect is not (2 or 3 or 4 or 5 or 9) || (!logo && effect == 5)) throw new ArgumentOutOfRangeException(nameof(effect));
         var current = await ReadConfig();
-        var config = current.Skip(4).Take(60).ToArray();
+        var config = SettingsPayload(current, true);
         // OEM switches cover bit 2 and logo bits 6..7 using read-modify-write.
         config[8] = logo ? (byte)((config[8] & 0x3f) | (effect == 4 ? 0 : effect == 5 ? 0x80 : 0x40)) : (byte)(effect == 4 ? config[8] & ~4 : config[8] | 4);
-        config[0] = 0; config[8] |= logo ? (byte)0x10 : (byte)0x20;
+        config[8] |= logo ? (byte)0x10 : (byte)0x20;
         await Exchange(2, config);
         if (effect is 4 or 5) { var verify = await ReadConfig(); if (verify[12] != config[8]) throw new IOException("灯区联动回读不一致。"); return; }
         await Exchange(0xd, logo ? (byte)0 : (byte)1, effect == 9 ? (byte)1 : effect, effect is 9 or 2 ? (byte)0xff : (byte)0);
@@ -107,7 +118,7 @@ internal sealed class Lighting(bool allowRemote = true)
     public async Task Enable(int area, bool enabled)
     {
         byte bit = area switch { 0 => 2, 1 => 0x10, 2 => 0x20, _ => throw new ArgumentOutOfRangeException(nameof(area)) };
-        var current = await ReadConfig(); var payload = current.Skip(4).Take(60).ToArray(); payload[0] = 0;
+        var current = await ReadConfig(); var payload = SettingsPayload(current, true);
         payload[8] = enabled ? (byte)(payload[8] | bit) : (byte)(payload[8] & ~bit);
         await Exchange(2, payload); var after = await ReadConfig();
         if (((after[12] & bit) != 0) != enabled) throw new IOException("灯区开关回读不一致。");

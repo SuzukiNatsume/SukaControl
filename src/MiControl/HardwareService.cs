@@ -25,7 +25,7 @@ internal static class HardwareProtocol
         if (request.Command == 0x50)
         {
             if (!request.Write || request.Value2 != 0 || request.Ack != 0 || request.Payload is not { Length: <= 61 } p) return false;
-            return request.Value switch { 1 => p.Length == 0, 2 => p.Length == 60 && p[0] == 0 && p[4] <= 4, 4 => p.Length == 61, 0xb => p.Length is 6 or 16 && p[0] <= 1, 0xc => p.Length == 1 && p[0] <= 1, 0xd => p.Length == 3 && p[0] <= 1 && p[1] is >= 1 and <= 3, _ => false };
+            return request.Value switch { 1 => p.Length == 0, 2 => p.Length == 60 && p[0] is 0 or 1 && p[4] <= 3 && (p[0] == 0 || p[1] != 0xff), 4 => p.Length == 61, 0xb => p.Length is 6 or 16 && p[0] <= 1, 0xc => p.Length == 1 && p[0] <= 1, 0xd => p.Length == 3 && p[0] <= 1 && p[1] is >= 1 and <= 3, _ => false };
         }
         if (request.Payload != null || request.Ack != 0) return false;
         if (!request.Write) return request.Value2 == 0 && (request.Command is 0 or 8 or 9 or 11 && request.Value == 0 || request.Command == 10 && request.Value is 1 or 2 or 6);
@@ -265,7 +265,7 @@ internal static class ServiceInstaller
         if (ping?.Ok != true) throw new IOException("SukaService did not become ready.");
         using (var key = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SukaControl"))
         {
-            key.SetValue("DisplayName", "SukaControl"); key.SetValue("DisplayVersion", "0.2.6"); key.SetValue("Publisher", "SuzukiNatsume"); key.SetValue("InstallLocation", target); key.SetValue("DisplayIcon", executable); key.SetValue("UninstallString", $"\"{executable}\" --uninstall"); key.SetValue("QuietUninstallString", $"\"{executable}\" --uninstall --quiet"); key.SetValue("NoModify", 1); key.SetValue("NoRepair", 1);
+            key.SetValue("DisplayName", "SukaControl"); key.SetValue("DisplayVersion", "0.2.7"); key.SetValue("Publisher", "SuzukiNatsume"); key.SetValue("InstallLocation", target); key.SetValue("DisplayIcon", executable); key.SetValue("UninstallString", $"\"{executable}\" --uninstall"); key.SetValue("QuietUninstallString", $"\"{executable}\" --uninstall --quiet"); key.SetValue("NoModify", 1); key.SetValue("NoRepair", 1);
         }
         CreateShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), "SukaControl.lnk"), executable);
         LegacyMigration.Complete(owner.Value);

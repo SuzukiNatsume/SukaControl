@@ -24,7 +24,7 @@ internal sealed class LiveEffects : IAsyncDisposable
         original = await lighting.ReadConfig();
         try
         {
-            var config = original.Skip(4).Take(60).ToArray(); config[0] = 0; config[1] = 0xff; config[8] |= 2;
+            var config = Lighting.SettingsPayload(original, false); config[1] = 0xff; config[8] |= 2;
             await lighting.Exchange(2, config);
             if (effect == "audioSync")
             {
@@ -121,7 +121,7 @@ internal sealed class LiveEffects : IAsyncDisposable
     {
         cancellation?.Cancel(); if (worker != null) await worker; worker = null; cancellation?.Dispose(); cancellation = null;
         if (audio != null) { audio.DataAvailable -= AudioData; audio.StopRecording(); audio.Dispose(); audio = null; }
-        if (original != null) { var restore = original; original = null; await lighting.Exchange(2, restore.Skip(4).Take(60).ToArray()); }
+        if (original != null) { var restore = original; original = null; await lighting.Exchange(2, Lighting.SettingsPayload(restore, false)); }
     }
     public async ValueTask DisposeAsync() => await Stop();
     [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr window);
