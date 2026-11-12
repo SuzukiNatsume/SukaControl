@@ -35,7 +35,8 @@ internal static class Program
         if (args.Contains("--exercise-keyboard")) { Diagnostics.ExerciseKeyboard().GetAwaiter().GetResult(); return; }
         if (args.Contains("--validate")) { Diagnostics.Validate().GetAwaiter().GetResult(); return; }
         using var mutex = new Mutex(true, @"Local\SukaControl-" + Environment.UserName, out var first);
-        if (!first) { if (args.Contains("--tray") && !args.Contains("--perform-f7")) return; if (!UserSession.Send(args.Contains("--perform-f7") ? (byte)4 : (byte)1)) MessageBox.Show(L.T("alreadyRunning"), "SukaControl"); return; }
+        bool startup = args.Contains("--startup") && !args.Contains("--perform-f7");
+        if (!first) { if (startup) return; if (args.Contains("--perform-f7")) UserSession.Send(1); if (!UserSession.Send(args.Contains("--perform-f7") ? (byte)4 : (byte)1)) MessageBox.Show(L.T("alreadyRunning"), "SukaControl"); return; }
         var app = new System.Windows.Application { ThemeMode = System.Windows.ThemeMode.System };
         app.DispatcherUnhandledException += (_, e) => { Store.Log(e.Exception.ToString()); System.Windows.MessageBox.Show(L.Error(e.Exception), "SukaControl"); e.Handled = true; };
         var window = new FluentWindow();
@@ -43,7 +44,7 @@ internal static class Program
         if (args.Contains("--perform-f7")) window.Dispatcher.BeginInvoke(async () => { await window.HardwareReady; await window.RunF7(); });
         if (args.Contains("--test-performance-ui")) window.Loaded += async (_, _) => { await window.HardwareReady; var result = await window.TestPerformanceUI(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "performance-ui-test.json"), JsonSerializer.Serialize(result, Store.Json)); await window.Exit(); };
         if (args.Contains("--screenshot")) window.Loaded += async (_, _) => { await Task.Delay(3500); string page = args.SkipWhile(x => x != "--page").Skip(1).FirstOrDefault() ?? "monitor"; window.SelectPage(page); await Task.Delay(200); window.SavePreview(Path.Combine(AppContext.BaseDirectory, "preview-" + L.Language + "-" + page + ".png")); await window.Exit(); };
-        if (args.Contains("--tray")) { app.MainWindow = window; app.ShutdownMode = System.Windows.ShutdownMode.OnMainWindowClose; window.StartInTray(); app.Run(); }
+        if (startup) { app.MainWindow = window; app.ShutdownMode = System.Windows.ShutdownMode.OnMainWindowClose; window.StartInTray(); app.Run(); }
         else app.Run(window);
     }
 }

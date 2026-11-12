@@ -4,6 +4,7 @@ internal static class StartupTask
 {
     const string RunPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string ApprovalPath = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+    internal static string Command => $"\"{Path.Combine(ServiceInstaller.InstallDirectory, "SukaControl.exe")}\" --startup";
     public static bool Enabled
     {
         get
@@ -16,7 +17,7 @@ internal static class StartupTask
     public static void Set(bool enabled)
     {
         using var key = Registry.CurrentUser.CreateSubKey(RunPath);
-        if (enabled) key.SetValue("SukaControl", $"\"{Path.Combine(ServiceInstaller.InstallDirectory, "SukaControl.exe")}\" --tray");
+        if (enabled) key.SetValue("SukaControl", Command);
         else key.DeleteValue("SukaControl", false);
         using var approved = Registry.CurrentUser.OpenSubKey(ApprovalPath, true); approved?.DeleteValue("SukaControl", false);
     }

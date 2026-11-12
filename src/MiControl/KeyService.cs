@@ -141,7 +141,7 @@ internal static class DesktopKeyAgent
                 {
                     case "copilot": using (var protocol = Microsoft.Win32.Registry.ClassesRoot.OpenSubKey("ms-copilot")) Shell(protocol != null ? "ms-copilot:" : "https://copilot.microsoft.com/"); break;
                     case "launchProgram": if (File.Exists(preferences.Program)) Shell(preferences.Program); break;
-                    case "toggleEye": Show("--perform-f7 --tray"); break;
+                    case "toggleEye": Show("--perform-f7"); break;
                 }
                 break;
         }

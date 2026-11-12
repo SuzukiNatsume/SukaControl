@@ -59,9 +59,10 @@ internal static class LegacyMigration
         {
             if (run?.GetValue("MiControl") is string old && old.Contains("MiControl.exe", StringComparison.OrdinalIgnoreCase) && run.GetValue("SukaControl") == null)
             {
-                run.SetValue("SukaControl", $"\"{Path.Combine(ServiceInstaller.InstallDirectory, "SukaControl.exe")}\" --tray");
+                run.SetValue("SukaControl", StartupTask.Command);
                 if (approved?.GetValue("MiControl") is byte[] value) approved.SetValue("SukaControl", value);
             }
+            if (run?.GetValue("SukaControl") is string current && current.Contains("SukaControl.exe", StringComparison.OrdinalIgnoreCase)) run.SetValue("SukaControl", StartupTask.Command);
             run?.DeleteValue("MiControl", false); approved?.DeleteValue("MiControl", false);
         }
         using (var service = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\MiControlHardware"))
