@@ -14,7 +14,18 @@ internal partial class FluentWindow : W.Window
     readonly Telemetry telemetry = new();
     readonly DisplayControl displayControl = new();
     readonly Preferences preferences = Preferences.Load();
-    readonly LiveEffects live;
+    readonly LightingSession lightingSession;
+    readonly SoftwareLighting softwareLighting;
+    readonly SemaphoreSlim lightingUiGate = new(1);
+    SoftwareLightingPreset? activeSoftwareLighting;
+    bool keyboardPreviewChanged;
+    Func<SoftwareLightingPreset?>? readSoftwareLighting;
+    readonly List<C.Button> lightApplyButtons = new();
+    readonly List<C.ComboBox> lightEffectChoices = new();
+    readonly List<Action<LightingReadback>> lightingBindings = new();
+    readonly List<Action> clearLightingDrafts = new();
+    C.Button? saveLightingButton;
+    bool closingPreview;
     readonly System.Windows.Threading.DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(2) };
     readonly System.Windows.Threading.DispatcherTimer keyTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
     readonly System.Windows.Threading.DispatcherTimer warmthTimer = new() { Interval = TimeSpan.FromMilliseconds(150) };
@@ -33,8 +44,6 @@ internal partial class FluentWindow : W.Window
     C.CheckBox? restorePerformanceSwitch, acFullSpeedSwitch;
     bool policySaving;
     C.Slider? keyboardBrightness;
-    int observedBrightness = -1;
-    bool? observedKeyboardEnabled;
     bool keyPolling;
     bool polling, exiting, updating;
     bool performanceSelectionDirty, graphicsSelectionDirty;
@@ -47,7 +56,9 @@ internal partial class FluentWindow : W.Window
         InitializeComponent();
         SourceInitialized += (_, _) => ApplyPalette();
         ApplyPalette(); SystemEvents.UserPreferenceChanged += ThemeChanged;
-        live = new(lighting); live.Failed += ex => Dispatcher.BeginInvoke(() => Status(L.Error(ex), true));
+        softwareLighting = new(lighting);
+        lightingSession = new(lighting, () => softwareLighting.HardwareBaseline);
+        softwareLighting.Failed += ex => Dispatcher.BeginInvoke(async () => { try { await RevertLighting(); } catch (Exception cleanup) { Store.Log(cleanup.ToString()); } Status(L.Error(ex), true); });
         string[] ids = ["monitor", "lighting", "display", "shortcuts", "settings"], icons = ["\uE9D9", "\uE781", "\uE7F4", "\uE765", "\uE713"];
         for (int i = 0; i < ids.Length; i++)
         {
@@ -70,7 +81,7 @@ internal partial class FluentWindow : W.Window
         timer.Tick += async (_, _) => await Poll();
         keyTimer.Tick += async (_, _) => await PollKeys();
         warmthTimer.Tick += async (_, _) => { warmthTimer.Stop(); preferences.Save(); if (eyeSwitch?.IsChecked == true) await Execute(() => { displayControl.Eye(Display, true, preferences.Warmth); return Task.CompletedTask; }); };
-        Closing += (_, e) => { if (!exiting) { e.Cancel = true; Hide(); } };
+        Closing += async (_, e) => { if (!exiting) { e.Cancel = true; await CloseToTray(); } };
         Closed += (_, _) => { timer.Stop(); keyTimer.Stop(); warmthTimer.Stop(); displayTimer.Stop(); menu.IsOpen = false; var icon = tray.Icon; tray.Dispose(); icon?.Dispose(); displayControl.Dispose(); firmware.Dispose(); SystemEvents.UserPreferenceChanged -= ThemeChanged; SystemEvents.DisplaySettingsChanged -= DisplaysChanged; };
         Activated += async (_, _) => { if (hardwareReady.Task.IsCompleted) await UpdateModes(); };
     }
@@ -145,11 +156,11 @@ internal partial class FluentWindow : W.Window
     C.Button Button(string key, Func<Task> action) { var button = new C.Button { Content = L.T(key), VerticalAlignment = W.VerticalAlignment.Center }; button.Click += async (_, _) => await Execute(action); return button; }
     C.Button Button(string key, Action action) => Button(key, () => { action(); return Task.CompletedTask; });
     C.ComboBox Choice(IEnumerable<object> values, int width = 190) { var box = new C.ComboBox { Width = width, MinHeight = 34, VerticalAlignment = W.VerticalAlignment.Center, Margin = new(8, 0, 0, 0) }; foreach (var value in values) box.Items.Add(value); if (box.Items.Count > 0) box.SelectedIndex = 0; return box; }
-    C.CheckBox Switch(string name, bool value, Func<bool, Task> action)
+    C.CheckBox Switch(string name, bool value, Func<bool, Task> action, string? successMessage = null)
     {
         var check = new C.CheckBox { IsChecked = value, Style = (W.Style)Resources["Switch"], ToolTip = L.T(name), Margin = new(12, 0, 0, 0) };
         System.Windows.Automation.AutomationProperties.SetName(check, L.T(name));
-        check.Click += async (_, _) => { if (!updating) { bool requested = check.IsChecked == true; bool ok = await Execute(() => action(requested)); if (!ok) check.IsChecked = !requested; } }; return check;
+        check.Click += async (_, _) => { if (!updating) { bool requested = check.IsChecked == true; bool ok = await Execute(() => action(requested), successMessage); if (!ok) check.IsChecked = !requested; } }; return check;
     }
     C.Border Card(W.UIElement content, int padding = 16)
     {
@@ -164,7 +175,7 @@ internal partial class FluentWindow : W.Window
         grid.Children.Add(labels); C.Grid.SetColumn(control, 1); grid.Children.Add(control); return Card(grid);
     }
     void Section(C.StackPanel page, string key) { var title = Text(L.T(key), 14); title.FontWeight = W.FontWeights.SemiBold; title.Margin = new(2, 20, 0, 10); page.Children.Add(title); }
-    void ShowPage(string id) { PageTitle.Text = L.T(id); PageSubtitle.Text = id == "monitor" ? L.T("live") : id == "lighting" ? L.T("realtimeNote") : id == "display" ? L.T("profileNote") : id == "shortcuts" ? L.T("trayNote") : L.T("independent"); PageContent.Content = pages[id]; }
+    void ShowPage(string id) { PageTitle.Text = L.T(id); PageSubtitle.Text = id == "monitor" ? L.T("live") : id == "lighting" ? "" : id == "display" ? L.T("profileNote") : id == "shortcuts" ? L.T("trayNote") : L.T("independent"); PageContent.Content = pages[id]; }
     void BuildMonitor()
     {
         var page = Page("monitor"); var grid = new C.Grid { Margin = new(0, 0, 0, 10) };
@@ -199,32 +210,125 @@ internal partial class FluentWindow : W.Window
     void BuildLighting()
     {
         var page = Page("lighting");
+        saveLightingButton = new C.Button { Content = L.T("saveLighting"), IsEnabled = false, HorizontalAlignment = W.HorizontalAlignment.Right };
+        saveLightingButton.Click += async (_, _) => await Execute(() => LightingOperation(SaveLighting), activeSoftwareLighting != null ? "softwareLightingSaved" : "lightingSaved");
+        var saveRow = new C.StackPanel { Margin = new(0, 0, 0, 12) }; saveRow.Children.Add(saveLightingButton); page.Children.Add(saveRow);
         for (int area = 0; area < 3; area++)
         {
             int index = area; string id = new[] { "keyboard", "logo", "bar" }[area];
-            var panel = new C.StackPanel(); var titleRow = new C.DockPanel(); var enable = Switch(id, true, async on => { if (index == 0) await live.Stop(); await lighting.Enable(index, on); }); lightSwitches.Add(enable); C.DockPanel.SetDock(enable, C.Dock.Right); titleRow.Children.Add(enable); var title = Text(L.T(id), 16); title.FontWeight = W.FontWeights.SemiBold; titleRow.Children.Add(title); panel.Children.Add(titleRow);
+            var apply = new C.Button { Content = L.T("apply") };
+            lightApplyButtons.Add(apply);
+            var dirty = new HashSet<string>(); bool built = false;
+            clearLightingDrafts.Add(dirty.Clear);
+            void Changed(string field) { if (built && !updating) { dirty.Add(field); apply.IsEnabled = true; Status(L.T("lightingParametersChanged")); } }
+            var panel = new C.StackPanel(); var titleRow = new C.DockPanel();
+            var enable = Switch(id, true, on => LightingOperation(async () => { if (index == 0) { await softwareLighting.Stop(); activeSoftwareLighting = null; keyboardPreviewChanged = true; } await lightingSession.Apply(() => lighting.Enable(index, on)); saveLightingButton.IsEnabled = lightingSession.Pending; }), "lightingPreviewApplied");
+            lightSwitches.Add(enable); C.DockPanel.SetDock(enable, C.Dock.Right); titleRow.Children.Add(enable); var title = Text(L.T(id), 16); title.FontWeight = W.FontWeights.SemiBold; titleRow.Children.Add(title); panel.Children.Add(titleRow);
             var choices = area == 0 ? new[] { new LightEffect("screenSync", -1), new LightEffect("audioSync", -2), new LightEffect("soft", -3), new LightEffect("rainbow", 7), new LightEffect("trigger", 5), new LightEffect("wavelet", 3), new LightEffect("colorwave", 6), new LightEffect("firefly", 10), new LightEffect("snake", 8), new LightEffect("wave", 1), new LightEffect("breath", 2), new LightEffect("keep", 9) } : area == 1 ? new[] { new LightEffect("keep", 9), new LightEffect("breath", 2), new LightEffect("gradient", 3), new LightEffect("linked", 4), new LightEffect("linkedBar", 5) } : new[] { new LightEffect("keep", 9), new LightEffect("breath", 2), new LightEffect("gradient", 3), new LightEffect("linked", 4) };
             var effect = Choice(choices, 210); effect.SelectedIndex = area == 0 ? choices.Length - 1 : 0;
+            lightEffectChoices.Add(effect);
             var bright = new C.Slider { Minimum = 0, Maximum = 3, Value = 2, TickFrequency = 1, IsSnapToTickEnabled = true, Width = 150, VerticalAlignment = W.VerticalAlignment.Center, Margin = new(8, 0, 0, 0) };
             var speed = new C.Slider { Minimum = 1, Maximum = 4, Value = 2, TickFrequency = 1, IsSnapToTickEnabled = true, Width = 150, VerticalAlignment = W.VerticalAlignment.Center, Margin = new(8, 0, 0, 0) };
-            var direction = Choice(new[] { new Option("right", 1), new Option("left", 0), new Option("down", 1), new Option("up", 0) }, 150);
+            var direction = Choice(new[] { new Option("right", 1), new Option("left", 0) }, 150);
             var audio = Choice(new[] { L.T("speaker"), L.T("microphone") }, 150);
-            Color color = Color.FromArgb(0, 120, 212); var colorButton = Button("colorPicker", () => { using var dialog = new ColorDialog { Color = color, FullOpen = true }; if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) color = dialog.Color; });
+            C.StackPanel? audioRow = null;
+            effect.SelectionChanged += (_, _) => Changed("effect"); direction.SelectionChanged += (_, _) => Changed("direction"); bright.ValueChanged += (_, _) => Changed("brightness"); speed.ValueChanged += (_, _) => Changed("speed");
+            Color color = Color.FromArgb(0, 120, 212);
+            if (area == 0 && preferences.SoftwareLighting is { } saved && choices.Any(choice => choice.Id == saved.Effect))
+            { effect.SelectedItem = choices.Single(choice => choice.Id == saved.Effect); bright.Value = Math.Clamp(saved.Brightness, 0, 3); speed.Value = Math.Clamp(saved.Speed, 1, 4); audio.SelectedIndex = saved.Microphone ? 1 : 0; color = Color.FromArgb(saved.Argb); }
+            C.Button? colorButton = null;
+            void ColorLabel() { if (colorButton != null) colorButton.Content = $"{L.T("colorPicker")} · #{color.R:X2}{color.G:X2}{color.B:X2}"; }
+            colorButton = new C.Button(); colorButton.Click += (_, _) => { using var dialog = new ColorDialog { Color = color, FullOpen = true }; if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) { color = dialog.Color; ColorLabel(); Changed("color"); } }; ColorLabel();
             var effectRow = new C.Grid { Margin = new(0, 16, 0, 0) }; effectRow.ColumnDefinitions.Add(new() { Width = new(100) }); effectRow.ColumnDefinitions.Add(new()); effectRow.Children.Add(Text(L.T("effect"))); C.Grid.SetColumn(effect, 1); effectRow.Children.Add(effect); panel.Children.Add(effectRow);
             var colorRow = new C.StackPanel { Orientation = C.Orientation.Horizontal, Margin = new(0, 10, 0, 0) }; colorRow.Children.Add(new C.TextBlock { Text = L.T("color"), Width = 100, VerticalAlignment = W.VerticalAlignment.Center }); colorRow.Children.Add(colorButton); panel.Children.Add(colorRow);
             if (area == 0)
             {
                 keyboardBrightness = bright;
-                foreach (var (label, control) in new (string, W.UIElement)[] { ("brightness", bright), ("speed", speed), ("direction", direction), ("audioSource", audio) }) { var row = new C.StackPanel { Orientation = C.Orientation.Horizontal, Margin = new(0, 10, 0, 0) }; row.Children.Add(new C.TextBlock { Text = L.T(label), Width = 100, VerticalAlignment = W.VerticalAlignment.Center }); row.Children.Add(control); panel.Children.Add(row); }
+                foreach (var (label, control) in new (string, W.UIElement)[] { ("brightness", bright), ("speed", speed), ("direction", direction) }) { var row = new C.StackPanel { Orientation = C.Orientation.Horizontal, Margin = new(0, 10, 0, 0) }; row.Children.Add(new C.TextBlock { Text = L.T(label), Width = 100, VerticalAlignment = W.VerticalAlignment.Center }); row.Children.Add(control); panel.Children.Add(row); }
+                audioRow = new C.StackPanel { Orientation = C.Orientation.Horizontal, Margin = new(0, 10, 0, 0), Visibility = ((LightEffect)effect.SelectedItem).Id == "audioSync" ? W.Visibility.Visible : W.Visibility.Collapsed }; audioRow.Children.Add(new C.TextBlock { Text = L.T("audioSource"), Width = 100, VerticalAlignment = W.VerticalAlignment.Center }); audioRow.Children.Add(audio); panel.Children.Add(audioRow);
+                effect.SelectionChanged += (_, _) => { audioRow.Visibility = (effect.SelectedItem as LightEffect)?.Id == "audioSync" ? W.Visibility.Visible : W.Visibility.Collapsed; };
+                audio.SelectionChanged += (_, _) => Changed("audio");
+                readSoftwareLighting = () => ((LightEffect)effect.SelectedItem).Code < 0 ? new(((LightEffect)effect.SelectedItem).Id, color.ToArgb(), (int)bright.Value, (int)speed.Value, audio.SelectedIndex == 1, (displays.SelectedItem as DisplayTarget)?.DeviceId) : null;
             }
-            var apply = Button("apply", async () =>
+            apply.Click += async (_, _) =>
             {
-                var selected = (LightEffect)effect.SelectedItem;
-                if (index == 0) { await live.Stop(); if (selected.Code < 0) await live.Start(selected.Id, color, bright.Value / 3, (int)speed.Value, audio.SelectedIndex == 1, displays.SelectedItem is DisplayTarget d ? d.GdiName : null); else await lighting.Keyboard((byte)selected.Code, (int)bright.Value, (int)speed.Value, color, ((Option)direction.SelectedItem).Code); }
-                else await lighting.Accent(index == 1, (byte)selected.Code, color);
+                apply.IsEnabled = false;
+                bool ok = await Execute(() => LightingOperation(async () =>
+                {
+                    var selected = effect.SelectedItem as LightEffect ?? throw new InvalidOperationException(L.T("selectLightingEffect"));
+                    if (index == 0)
+                    {
+                        await softwareLighting.Stop(); activeSoftwareLighting = readSoftwareLighting?.Invoke();
+                        keyboardPreviewChanged = true;
+                        await lightingSession.Apply(() => activeSoftwareLighting is { } preset ? StartSoftwareLighting(preset) : lighting.Keyboard((byte)selected.Code, (int)bright.Value, (int)speed.Value, color, ((Option)direction.SelectedItem).Code));
+                    }
+                    else await lightingSession.Apply(() => lighting.Accent(index == 1, (byte)selected.Code, color));
+                    saveLightingButton.IsEnabled = lightingSession.Pending;
+                    dirty.Clear();
+                }), "lightingPreviewApplied");
+                if (!ok) apply.IsEnabled = true;
+            };
+            var actions = Horizontal(apply); actions.HorizontalAlignment = W.HorizontalAlignment.Right; actions.Margin = new(0, 16, 0, 0); panel.Children.Add(actions); page.Children.Add(Card(panel, 20));
+            lightingBindings.Add(state =>
+            {
+                var config = state.Config; var preset = index == 0 && softwareLighting.Running ? activeSoftwareLighting : null;
+                int code; Color actualColor;
+                if (index == 0)
+                {
+                    code = preset?.Effect switch { "screenSync" => -1, "audioSync" => -2, "soft" => -3, _ => config[5] == 11 ? 9 : config[5] };
+                    int Channel(byte value) => value == 127 ? 255 : Math.Min(255, value * 2);
+                    actualColor = preset != null ? Color.FromArgb(preset.Argb) : Color.FromArgb(Channel(config[18]), Channel(config[19]), Channel(config[20]));
+                    if (preset != null && preset.Brightness != config[8]) { activeSoftwareLighting = preset with { Brightness = config[8] }; preset = activeSoftwareLighting; }
+                    if (!dirty.Contains("brightness") && !bright.IsMouseCaptureWithin) bright.Value = config[8];
+                    if (!dirty.Contains("speed") && !speed.IsMouseCaptureWithin) speed.Value = Math.Clamp(preset?.Speed ?? config[9], 1, 4);
+                    if (!dirty.Contains("direction")) direction.SelectedItem = direction.Items.Cast<Option>().FirstOrDefault(option => option.Code == config[7]);
+                    if (!dirty.Contains("audio") && preset != null) audio.SelectedIndex = preset.Microphone ? 1 : 0;
+                }
+                else
+                {
+                    var mode = index == 1 ? state.Logo : state.Bar; var rgb = index == 1 ? state.LogoColor : state.BarColor;
+                    int linked = index == 1 ? (config[12] >> 6) & 3 : (config[12] & 4) == 0 ? 0 : 1;
+                    code = linked == 0 ? 4 : index == 1 && linked == 2 ? 5 : mode[5] == 1 ? 9 : mode[5];
+                    actualColor = Color.FromArgb(rgb[6], rgb[7], rgb[8]);
+                }
+                if (!dirty.Contains("effect")) effect.SelectedItem = choices.FirstOrDefault(choice => choice.Code == code);
+                if (!dirty.Contains("color")) { color = actualColor; ColorLabel(); }
+                enable.IsChecked = (config[12] & new[] { 2, 16, 32 }[index]) != 0;
+                int selectedCode = (effect.SelectedItem as LightEffect)?.Code ?? 0;
+                colorButton.IsEnabled = index == 0 ? selectedCode is 9 or -1 or -2 or -3 : selectedCode is 9 or 2;
+                speed.IsEnabled = selectedCode is not (9 or -1); direction.IsEnabled = selectedCode > 0 && selectedCode != 9;
             });
-            var actions = Horizontal(apply); actions.HorizontalAlignment = W.HorizontalAlignment.Right; actions.Margin = new(0, 16, 0, 0); if (area == 0) actions.Children.Insert(0, Button("stopEffect", () => live.Stop())); panel.Children.Add(actions); page.Children.Add(Card(panel, 20));
+            built = true;
         }
+    }
+    async Task LightingOperation(Func<Task> action)
+    {
+        await lightingUiGate.WaitAsync(); pages["lighting"].IsEnabled = false;
+        try { await action(); }
+        finally { pages["lighting"].IsEnabled = true; lightingUiGate.Release(); }
+    }
+    Task StartSoftwareLighting(SoftwareLightingPreset preset)
+    {
+        string? screen = DisplayControl.Displays().FirstOrDefault(display => display.DeviceId == preset.DisplayId)?.GdiName;
+        return softwareLighting.Start(preset.Effect, Color.FromArgb(preset.Argb), Math.Clamp(preset.Brightness, 0, 3) / 3.0, Math.Clamp(preset.Speed, 1, 4), preset.Microphone, screen);
+    }
+    async Task SaveLighting()
+    {
+        var preset = activeSoftwareLighting;
+        await softwareLighting.Stop();
+        if (preset != null) await lighting.Keyboard(9, Math.Clamp(preset.Brightness, 0, 3), Math.Clamp(preset.Speed, 1, 4), Color.FromArgb(preset.Argb));
+        await lightingSession.Save();
+        if (keyboardPreviewChanged || preset != null) preferences.SoftwareLighting = preset;
+        preferences.Save(); keyboardPreviewChanged = false; saveLightingButton!.IsEnabled = false;
+        foreach (var clear in clearLightingDrafts) clear();
+        foreach (var button in lightApplyButtons) button.IsEnabled = true;
+        if (preset != null) await StartSoftwareLighting(preset);
+    }
+    async Task ResumeSavedSoftwareLighting()
+    {
+        if (preferences.SoftwareLighting is not { Effect: "screenSync" or "audioSync" or "soft" } preset) return;
+        try { await LightingOperation(async () => { if (keyboardBrightness != null) { updating = true; keyboardBrightness.Value = Math.Clamp(preset.Brightness, 0, 3); updating = false; } await StartSoftwareLighting(preset); activeSoftwareLighting = preset; }); }
+        catch (Exception ex) { Store.Log("Saved software lighting: " + ex); Status(L.Error(ex), true); }
     }
     void BuildDisplay()
     {
@@ -259,7 +363,7 @@ internal partial class FluentWindow : W.Window
         var actions = Horizontal(Button("refresh", InitializeHardware), Button("diagnostics", async () => { string path = await Diagnostics.Write(); Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true }); }), Button("logs", () => Process.Start(new ProcessStartInfo(Store.Root) { UseShellExecute = true }))); actions.Margin = new(0, 12, 0, 12); page.Children.Add(actions);
         if (!HardwareClient.Installed) page.Children.Add(Setting("installService", "serviceNote", Button("installService", async () => { var process = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--install-service --owner-sid " + System.Security.Principal.WindowsIdentity.GetCurrent().User!.Value) { UseShellExecute = true, Verb = "runas" }); if (process != null) await process.WaitForExitAsync(); if (!HardwareClient.Installed) throw new IOException("Service install failed."); await InitializeHardware(); })));
         Section(page, "about");
-        var about = new C.StackPanel(); about.Children.Add(Text("SukaControl 0.2.7"));
+        var about = new C.StackPanel(); about.Children.Add(Text("SukaControl 0.2.8"));
         var author = new System.Windows.Documents.Hyperlink(new System.Windows.Documents.Run("SuzukiNatsume")) { NavigateUri = new Uri("https://github.com/SuzukiNatsume") };
         author.RequestNavigate += (_, e) => { Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true }); e.Handled = true; };
         var link = Text(""); link.Margin = new(0, 8, 0, 0); link.Inlines.Add(author); about.Children.Add(link); page.Children.Add(Card(about));
@@ -268,7 +372,7 @@ internal partial class FluentWindow : W.Window
     {
         try { await Task.Run(firmware.Connect); firmwareText.Text = L.T("connected"); } catch (Exception ex) { firmwareText.Text = L.Error(ex); }
         try { lighting.Detect(); var config = await lighting.ReadConfig(); for (int i = 0; i < 3; i++) lightSwitches[i].IsChecked = (config[12] & new[] { 2, 16, 32 }[i]) != 0; lightingText.Text = L.T("connected"); } catch (Exception ex) { lightingText.Text = L.Error(ex); }
-        await UpdateModes(); await PollKeys(); await Poll(); Status(L.T("ready")); hardwareReady.TrySetResult();
+        await UpdateModes(); await PollKeys(); await Poll(); Status(L.T("ready")); await ResumeSavedSoftwareLighting(); hardwareReady.TrySetResult();
     }
     async Task UpdateModes()
     {
@@ -293,6 +397,7 @@ internal partial class FluentWindow : W.Window
             if (!reply.Ok || reply.Keys == null) return;
             var state = reply.Keys;
             updating = true;
+            if (lightingUiGate.CurrentCount != 0 && reply.Lights is { } lights) foreach (var bind in lightingBindings) bind(lights);
             if (!policySaving && reply.Policy is { } policy && restorePerformanceSwitch != null && acFullSpeedSwitch != null)
             {
                 restorePerformanceSwitch.IsChecked = policy.RestoreOnStartup; acFullSpeedSwitch.IsChecked = policy.FullSpeedOnAC;
@@ -301,10 +406,6 @@ internal partial class FluentWindow : W.Window
             if (state.PerformanceMode > 0) UpdatePerformanceReadback(state.PerformanceMode);
             if (fnSwitch != null) fnSwitch.IsChecked = state.FnLocked;
             if (winSwitch != null) winSwitch.IsChecked = state.WinLocked;
-            if (keyboardBrightness != null && state.Brightness >= 0 && state.Brightness != observedBrightness && !keyboardBrightness.IsMouseCaptureWithin)
-            { keyboardBrightness.Value = state.Brightness; observedBrightness = state.Brightness; }
-            if (state.Brightness >= 0 && observedKeyboardEnabled != state.KeyboardEnabled)
-            { lightSwitches[0].IsChecked = state.KeyboardEnabled; observedKeyboardEnabled = state.KeyboardEnabled; }
         }
         catch (Exception ex) { Store.Log("Key state: " + ex.Message); }
         finally { updating = false; keyPolling = false; }
@@ -388,10 +489,160 @@ internal partial class FluentWindow : W.Window
     void Restart() { if (W.MessageBox.Show(this, L.T("restartConfirm"), L.T("restart"), W.MessageBoxButton.YesNo, W.MessageBoxImage.Question) == W.MessageBoxResult.Yes) Process.Start(new ProcessStartInfo("shutdown.exe", "/r /t 0") { UseShellExecute = false, CreateNoWindow = true }); }
     public void Restore() { Show(); WindowState = W.WindowState.Normal; Activate(); }
     internal void SelectPage(string id) { foreach (C.ListBoxItem item in Navigation.Items) if ((string)item.Tag == id) { Navigation.SelectedItem = item; break; } }
-    public async Task Exit(bool restoreColor = false) { exiting = true; timer.Stop(); keyTimer.Stop(); warmthTimer.Stop(); try { await live.Stop(); } catch (Exception ex) { Store.Log(ex.ToString()); } if (restoreColor) foreach (var snapshot in preferences.ColorBackups.Values) snapshot.Restore(); Close(); }
-    async Task<bool> Execute(Func<Task> action)
+    async Task CloseToTray()
     {
-        Status(L.T("working")); try { await action(); Status(L.T("done")); return true; } catch (Exception ex) { Status(ex is InvalidOperationException ? ex.Message : L.Error(ex), true); return false; }
+        if (closingPreview) return;
+        closingPreview = true;
+        IsEnabled = false;
+        try
+        {
+            // Always enter the session gate, including when Apply is still capturing its baseline.
+            if (!await Execute(CancelTemporaryLighting, "lightingPreviewEnded")) return;
+            Hide();
+        }
+        finally { closingPreview = false; IsEnabled = true; }
+    }
+    Task RevertLighting() => LightingOperation(async () =>
+    {
+        await softwareLighting.Stop(); activeSoftwareLighting = null; keyboardPreviewChanged = false;
+        await lightingSession.Revert();
+        foreach (var clear in clearLightingDrafts) clear();
+        if (saveLightingButton != null) saveLightingButton.IsEnabled = false;
+        foreach (var button in lightApplyButtons) button.IsEnabled = true;
+    });
+    Task CancelTemporaryLighting() => LightingOperation(async () =>
+    {
+        if (lightingSession.Pending)
+        {
+            await softwareLighting.Stop(); activeSoftwareLighting = null; keyboardPreviewChanged = false;
+            await lightingSession.Revert();
+            if (preferences.SoftwareLighting is { Effect: "screenSync" or "audioSync" or "soft" } saved)
+            {
+                try { await StartSoftwareLighting(saved); activeSoftwareLighting = saved; }
+                catch (Exception ex) { Store.Log("Resume saved lighting after preview: " + ex); }
+            }
+        }
+        foreach (var clear in clearLightingDrafts) clear();
+        if (saveLightingButton != null) saveLightingButton.IsEnabled = false;
+        foreach (var button in lightApplyButtons) button.IsEnabled = true;
+    });
+    internal async Task<Dictionary<string, object?>> TestLightingUI()
+    {
+        var result = new Dictionary<string, object?>();
+        await LightingOperation(async () => { await softwareLighting.Stop(); activeSoftwareLighting = null; });
+        var before = await lighting.ReadConfig();
+        try
+        {
+            SelectPage("lighting");
+            lightEffectChoices[0].SelectedItem = lightEffectChoices[0].Items.Cast<LightEffect>().Single(effect => effect.Code == 2);
+            lightApplyButtons[0].RaiseEvent(new W.RoutedEventArgs(C.Button.ClickEvent));
+            for (int i = 0; i < 100 && saveLightingButton?.IsEnabled != true; i++) await Task.Delay(50);
+            result["applyDisabled"] = !lightApplyButtons[0].IsEnabled;
+            result["saveEnabled"] = saveLightingButton?.IsEnabled == true;
+            result["savePrompt"] = StatusText.Text == L.T("lightingPreviewApplied");
+            if (result["applyDisabled"] is not true || result["saveEnabled"] is not true || result["savePrompt"] is not true) throw new IOException("Apply/Save UI state failed.");
+            if ((await lighting.ReadConfig())[5] != 2) throw new IOException("Preview effect was not applied.");
+            lightEffectChoices[0].SelectedIndex = 0;
+            result["parameterChangeReenablesApply"] = lightApplyButtons[0].IsEnabled;
+            await CloseToTray();
+            var after = await lighting.ReadConfig();
+            result["closeHidesWindow"] = !IsVisible;
+            result["closeRestoresSettings"] = after.AsSpan(5, 59).SequenceEqual(before.AsSpan(5, 59));
+            result["passed"] = lightApplyButtons[0].IsEnabled && !IsVisible && result["closeRestoresSettings"] is true;
+        }
+        catch (Exception ex) { result["passed"] = false; result["error"] = ex.ToString(); }
+        finally { await RevertLighting(); }
+        return result;
+    }
+    internal async Task<Dictionary<string, object?>> TestSoftwareLightingUI()
+    {
+        var result = new Dictionary<string, object?>();
+        await LightingOperation(async () => { await softwareLighting.Stop(); activeSoftwareLighting = null; });
+        var before = await lighting.ReadConfig(); var oldPreference = preferences.SoftwareLighting;
+        try
+        {
+            SelectPage("lighting");
+            lightEffectChoices[0].SelectedItem = lightEffectChoices[0].Items.Cast<LightEffect>().Single(effect => effect.Id == "soft");
+            lightApplyButtons[0].RaiseEvent(new W.RoutedEventArgs(C.Button.ClickEvent));
+            for (int i = 0; i < 100 && (softwareLighting.FramesWritten == 0 || !softwareLighting.Running || saveLightingButton?.IsEnabled != true); i++) await Task.Delay(50);
+            if (!softwareLighting.Running || softwareLighting.FramesWritten == 0) throw new IOException("Soft glow preview did not start.");
+            result["softwarePreviewStarted"] = true;
+            result["framesWritten"] = softwareLighting.FramesWritten;
+            saveLightingButton!.RaiseEvent(new W.RoutedEventArgs(C.Button.ClickEvent));
+            for (int i = 0; i < 100 && (StatusText.Text != L.T("softwareLightingSaved") || !softwareLighting.Running); i++) await Task.Delay(50);
+            if (preferences.SoftwareLighting?.Effect != "soft" || StatusText.Text != L.T("softwareLightingSaved")) throw new IOException("Software effect settings were not saved.");
+            result["softwareParametersSaved"] = true;
+            result["applyReenabledAfterSave"] = lightApplyButtons[0].IsEnabled;
+            if (!lightApplyButtons[0].IsEnabled) throw new IOException("Save did not reenable Apply.");
+            await CloseToTray();
+            var fallback = await lighting.ReadConfig();
+            result["savedSoftwareContinuesInTray"] = softwareLighting.Running;
+            result["hardwareFallbackMode"] = fallback[5];
+            result["passed"] = softwareLighting.Running && fallback[5] == 11 && !IsVisible;
+        }
+        catch (Exception ex) { result["passed"] = false; result["error"] = ex.ToString(); }
+        finally
+        {
+            await RevertLighting(); await lighting.Exchange(2, Lighting.SettingsPayload(before, true)); await lighting.Save();
+            preferences.SoftwareLighting = oldPreference; preferences.Save();
+            var after = await lighting.ReadConfig(); result["originalHardwareRestored"] = after.AsSpan(5, 59).SequenceEqual(before.AsSpan(5, 59));
+            if (result["originalHardwareRestored"] is not true) result["passed"] = false;
+        }
+        return result;
+    }
+    internal async Task<Dictionary<string, object?>> TestLightingReadbackUI()
+    {
+        var result = new Dictionary<string, object?>();
+        await RevertLighting(); var before = await lighting.ReadConfig();
+        try
+        {
+            await lighting.Keyboard(2, 1, 3, Color.Coral, 0);
+            for (int i = 0; i < 60; i++)
+            {
+                await PollKeys();
+                if ((lightEffectChoices[0].SelectedItem as LightEffect)?.Code == 2 && keyboardBrightness?.Value == 1) break;
+                await Task.Delay(50);
+            }
+            result["externalEffectReflected"] = (lightEffectChoices[0].SelectedItem as LightEffect)?.Code == 2;
+            result["externalBrightnessReflected"] = keyboardBrightness?.Value == 1;
+            result["passed"] = result["externalEffectReflected"] is true && result["externalBrightnessReflected"] is true;
+        }
+        finally { await lighting.Exchange(2, Lighting.SettingsPayload(before, false)); }
+        return result;
+    }
+    internal async Task<Dictionary<string, object?>> TestAudioLightingUI()
+    {
+        var result = new Dictionary<string, object?>();
+        await RevertLighting(); var before = await lighting.ReadConfig(); var oldPreference = preferences.SoftwareLighting; preferences.SoftwareLighting = null;
+        try
+        {
+            SelectPage("lighting");
+            lightEffectChoices[0].SelectedItem = lightEffectChoices[0].Items.Cast<LightEffect>().Single(effect => effect.Id == "audioSync");
+            if (keyboardBrightness != null) keyboardBrightness.Value = 2;
+            lightApplyButtons[0].RaiseEvent(new W.RoutedEventArgs(C.Button.ClickEvent));
+            for (int i = 0; i < 100 && (!softwareLighting.Running || saveLightingButton?.IsEnabled != true); i++) await Task.Delay(50);
+            using var device = NAudio.Wave.WasapiLoopbackCapture.GetDefaultLoopbackCaptureDevice();
+            result["outputMuted"] = device.AudioEndpointVolume.Mute;
+            using var output = new NAudio.Wave.WasapiOut(device, NAudio.CoreAudioApi.AudioClientShareMode.Shared, false, 100);
+            var format = NAudio.Wave.WaveFormat.CreateIeeeFloatWaveFormat(48000, 2);
+            var buffer = new NAudio.Wave.BufferedWaveProvider(format);
+            var tone = new byte[48000 * 2 * 4 * 2];
+            for (int i = 0; i < 48000 * 2; i++) for (int channel = 0; channel < 2; channel++) BitConverter.GetBytes((float)(.04 * Math.Sin(2 * Math.PI * 440 * i / 48000))).CopyTo(tone, (i * 2 + channel) * 4);
+            buffer.AddSamples(tone, 0, tone.Length); output.Init(buffer); output.Play();
+            for (int i = 0; i < 60 && (softwareLighting.AudioFramesReceived == 0 || softwareLighting.AudioPeak < .0001 || softwareLighting.LitKeys == 0); i++) await Task.Delay(50);
+            result["audioFramesReceived"] = softwareLighting.AudioFramesReceived; result["audioPeak"] = softwareLighting.AudioPeak; result["litKeys"] = softwareLighting.LitKeys;
+            result["controllerBrightness"] = (await lighting.ReadConfig())[8];
+            result["passed"] = softwareLighting.AudioFramesReceived > 0 && softwareLighting.AudioPeak >= .0001 && softwareLighting.LitKeys > 0;
+            output.Stop(); await CloseToTray(); result["closeStopsAudio"] = !softwareLighting.Running;
+        }
+        catch (Exception ex) { result["passed"] = false; result["error"] = ex.ToString(); }
+        finally { await RevertLighting(); await lighting.Exchange(2, Lighting.SettingsPayload(before, false)); preferences.SoftwareLighting = oldPreference; }
+        return result;
+    }
+    public async Task Exit(bool restoreColor = false) { exiting = true; IsEnabled = false; timer.Stop(); keyTimer.Stop(); warmthTimer.Stop(); try { await RevertLighting(); } catch (Exception ex) { Store.Log(ex.ToString()); } if (restoreColor) foreach (var snapshot in preferences.ColorBackups.Values) snapshot.Restore(); Close(); }
+    async Task<bool> Execute(Func<Task> action, string? successMessage = null)
+    {
+        Status(L.T("working")); try { await action(); Status(L.T(successMessage ?? "done")); return true; } catch (Exception ex) { Status(ex is InvalidOperationException ? ex.Message : L.Error(ex), true); return false; }
     }
     void Status(string text, bool error = false) { StatusText.Text = error ? L.T("error") + " · " + text : text; Store.Log(text); }
     internal void SavePreview(string path)

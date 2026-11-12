@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <Version>0.2.7</Version>
+    <Version>0.2.8</Version>
     <AssemblyName>SukaControl</AssemblyName>
     <RootNamespace>SukaControl</RootNamespace>
     <ApplicationIcon>Assets\MiControl.ico</ApplicationIcon>
@@ -15,12 +15,12 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="Core.cs;Native.cs;Lighting.cs;HardwareService.cs;KeyService.cs;SessionAgent.cs;UserSession.cs;Language.cs" />
+    <Compile Remove="Core.cs;Native.cs;Lighting.cs;LightingSession.cs;HardwareService.cs;KeyService.cs;SessionAgent.cs;UserSession.cs;Language.cs" />
     <ProjectReference Include="..\Suka.Core\Suka.Core.csproj" />
     <Resource Include="Assets\*.ico" />
     <Content Include="Licenses\**\*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
-    <PackageReference Include="NAudio" Version="2.2.1" />
     <PackageReference Include="System.Management" Version="11.0.0" />
+    <PackageReference Include="NAudio" Version="2.2.1" />
     <Content Include="Profiles\xiaomi_*.icc" Link="Profiles\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.0" />
   </ItemGroup>

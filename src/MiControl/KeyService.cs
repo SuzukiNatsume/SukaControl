@@ -6,6 +6,7 @@ namespace SukaControl;
 
 internal record KeyState(bool FnLocked, bool WinLocked, int Brightness, bool KeyboardEnabled, long Revision, int PerformanceMode = 0);
 internal record KeyAction(long Id, string Name, long Created);
+internal record LightingReadback(byte[] Config, byte[] Logo, byte[] Bar, byte[] LogoColor, byte[] BarColor);
 
 // Firmware decides whether a physical key is F1-F12 or an OEM shortcut. Never hook or reinject it.
 internal sealed class KeyService : IDisposable
@@ -21,6 +22,7 @@ internal sealed class KeyService : IDisposable
     readonly Task sessionWorker;
     long lastState, lastLight, lastPerformance, revision, actionId;
     KeyState state = new(false, false, -1, false, 0);
+    public LightingReadback? Lights { get; private set; }
     public KeyService(Firmware firmware, Lighting lighting, string ownerSid)
     {
         this.firmware = firmware; this.lighting = lighting; launcher = new(ownerSid);
@@ -77,8 +79,8 @@ internal sealed class KeyService : IDisposable
         if (time - lastPerformance >= 1500) { performance = firmware.Performance(); lastPerformance = time; }
         if (time - lastLight >= 400)
         {
-            try { var config = await lighting.ReadConfig(); brightness = config[8]; enabled = (config[12] & 2) != 0; lastLight = time; }
-            catch (Exception ex) { lastLight = time; Store.Log("Key light state: " + ex.Message); }
+            try { var config = await lighting.ReadConfig(); brightness = config[8]; enabled = (config[12] & 2) != 0; Lights = new(config, await lighting.Exchange(0xc, 0), await lighting.Exchange(0xc, 1), await lighting.Exchange(0xa, 0), await lighting.Exchange(0xa, 1)); lastLight = time; }
+            catch (Exception ex) { Lights = null; lastLight = time; Store.Log("Key light state: " + ex.Message); }
         }
         if (fn != state.FnLocked || win != state.WinLocked || brightness != state.Brightness || enabled != state.KeyboardEnabled || performance != state.PerformanceMode) revision++;
         state = new(fn, win, brightness, enabled, revision, performance);

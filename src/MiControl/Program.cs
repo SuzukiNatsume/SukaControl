@@ -43,6 +43,10 @@ internal static class Program
         using var session = new UserSession(async command => await window.Dispatcher.InvokeAsync(async () => { if (command == 1) window.Restore(); else if (command == 4) await window.RunF7(); else await window.Exit(command == 3); }).Task.Unwrap());
         if (args.Contains("--perform-f7")) window.Dispatcher.BeginInvoke(async () => { await window.HardwareReady; await window.RunF7(); });
         if (args.Contains("--test-performance-ui")) window.Loaded += async (_, _) => { await window.HardwareReady; var result = await window.TestPerformanceUI(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "performance-ui-test.json"), JsonSerializer.Serialize(result, Store.Json)); await window.Exit(); };
+        if (args.Contains("--test-lighting-ui")) window.Loaded += async (_, _) => { await window.HardwareReady; var result = await window.TestLightingUI(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "lighting-ui-test.json"), JsonSerializer.Serialize(result, Store.Json)); await window.Exit(); };
+        if (args.Contains("--test-software-lighting-ui")) window.Loaded += async (_, _) => { await window.HardwareReady; var result = await window.TestSoftwareLightingUI(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "software-lighting-ui-test.json"), JsonSerializer.Serialize(result, Store.Json)); await window.Exit(); };
+        if (args.Contains("--test-lighting-readback-ui")) window.Loaded += async (_, _) => { await window.HardwareReady; var result = await window.TestLightingReadbackUI(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "lighting-readback-ui-test.json"), JsonSerializer.Serialize(result, Store.Json)); await window.Exit(); };
+        if (args.Contains("--test-audio-lighting-ui")) window.Loaded += async (_, _) => { await window.HardwareReady; var result = await window.TestAudioLightingUI(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "audio-lighting-ui-test.json"), JsonSerializer.Serialize(result, Store.Json)); await window.Exit(); };
         if (args.Contains("--screenshot")) window.Loaded += async (_, _) => { await Task.Delay(3500); string page = args.SkipWhile(x => x != "--page").Skip(1).FirstOrDefault() ?? "monitor"; window.SelectPage(page); await Task.Delay(200); window.SavePreview(Path.Combine(AppContext.BaseDirectory, "preview-" + L.Language + "-" + page + ".png")); await window.Exit(); };
         if (startup) { app.MainWindow = window; app.ShutdownMode = System.Windows.ShutdownMode.OnMainWindowClose; window.StartInTray(); app.Run(); }
         else app.Run(window);
@@ -180,17 +184,6 @@ internal static class Diagnostics
                 await light.Exchange(2, before.Skip(4).Take(60).ToArray());
                 var restored = await light.ReadConfig();
                 if (!restored.AsSpan(4).SequenceEqual(before.AsSpan(4))) throw new IOException("灯效原始配置恢复校验失败。");
-            }
-        });
-        await Test("liveEffects", async () =>
-        {
-            await using var engine = new LiveEffects(light);
-            Exception? failure = null; engine.Failed += ex => failure = ex;
-            foreach (string effect in new[] { "soft", "screenSync", "audioSync" })
-            {
-                await engine.Start(effect, Color.Coral, .5, 2, false);
-                await Task.Delay(350); await engine.Stop();
-                if (failure != null) throw failure;
             }
         });
         await Test("colorProfile", () =>

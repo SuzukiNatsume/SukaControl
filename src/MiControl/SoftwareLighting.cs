@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 
 namespace SukaControl;
 
-internal sealed class LiveEffects : IAsyncDisposable
+internal sealed class SoftwareLighting : IAsyncDisposable
 {
     readonly Lighting lighting;
     CancellationTokenSource? cancellation;
@@ -15,16 +15,27 @@ internal sealed class LiveEffects : IAsyncDisposable
     readonly float[] samples = new float[1024];
     int samplePosition;
     double[] spectrum = new double[17];
+    int framesWritten;
+    long audioFramesReceived;
+    double audioPeak;
+    int litKeys;
+    internal long AudioFramesReceived => Interlocked.Read(ref audioFramesReceived);
+    internal double AudioPeak => Volatile.Read(ref audioPeak);
+    internal int LitKeys => Volatile.Read(ref litKeys);
+    internal int FramesWritten => Volatile.Read(ref framesWritten);
     public bool Running => worker is { IsCompleted: false };
+    internal byte[]? HardwareBaseline => original == null ? null : (byte[])original.Clone();
     public event Action<Exception>? Failed;
-    public LiveEffects(Lighting lighting) => this.lighting = lighting;
+    public SoftwareLighting(Lighting lighting) => this.lighting = lighting;
     public async Task Start(string effect, Color color, double brightness, int speed, bool microphone, string? displayName = null)
     {
         await Stop();
+        Interlocked.Exchange(ref framesWritten, 0);
+        Interlocked.Exchange(ref audioFramesReceived, 0); Volatile.Write(ref audioPeak, 0); Volatile.Write(ref spectrum, new double[17]); samplePosition = 0;
         original = await lighting.ReadConfig();
         try
         {
-            var config = Lighting.SettingsPayload(original, false); config[1] = 0xff; config[8] |= 2;
+            var config = Lighting.SettingsPayload(original, false); config[1] = 0xff; config[4] = (byte)Math.Clamp((int)Math.Round(brightness * 3), 0, 3); config[8] |= 2;
             await lighting.Exchange(2, config);
             if (effect == "audioSync")
             {
@@ -32,6 +43,7 @@ internal sealed class LiveEffects : IAsyncDisposable
                 audio.DataAvailable += AudioData;
                 audio.RecordingStopped += (_, e) => { if (e.Exception != null) { Failed?.Invoke(e.Exception); cancellation?.Cancel(); } };
                 audio.StartRecording();
+                Store.Log($"Audio visualizer started: {(microphone ? "microphone" : "system playback")}, {audio.WaveFormat.Encoding}, {audio.WaveFormat.BitsPerSample}-bit, {audio.WaveFormat.Channels} channels, {audio.WaveFormat.SampleRate} Hz");
             }
             var screen = Screen.AllScreens.FirstOrDefault(s => s.DeviceName == displayName) ?? Screen.PrimaryScreen ?? Screen.AllScreens.First();
             cancellation = new(); var token = cancellation.Token;
@@ -47,23 +59,24 @@ internal sealed class LiveEffects : IAsyncDisposable
                         if (effect == "screenSync")
                         {
                             using var bitmap = SampleScreen(screen.Bounds);
-                            for (int y = 0; y < 6; y++) for (int x = 0; x < 17; x++) colors[y * 17 + x] = Scale(bitmap.GetPixel(x, y), brightness);
+                            for (int y = 0; y < 6; y++) for (int x = 0; x < 17; x++) colors[y * 17 + x] = bitmap.GetPixel(x, y);
                         }
                         else if (effect == "audioSync")
                         {
                             var levels = Volatile.Read(ref spectrum);
-                            for (int y = 0; y < 6; y++) for (int x = 0; x < 17; x++) colors[y * 17 + x] = y >= 6 - levels[x] * 6 ? Scale(Hue(x / 17.0 * 280 + phase), brightness) : Color.Black;
+                            for (int y = 0; y < 6; y++) for (int x = 0; x < 17; x++) { int height = levels[x] <= 0 ? 0 : Math.Max(1, (int)Math.Round(levels[x] * 6)); colors[y * 17 + x] = y >= 6 - height ? color : Color.Black; }
                         }
                         else
                         {
-                            for (int y = 0; y < 6; y++) for (int x = 0; x < 17; x++) colors[y * 17 + x] = Scale(color, brightness * (.35 + .65 * (.5 + .5 * Math.Sin(phase / 25 + x / 5.0 + y / 4.0))));
+                            for (int y = 0; y < 6; y++) for (int x = 0; x < 17; x++) colors[y * 17 + x] = Scale(color, .35 + .65 * (.5 + .5 * Math.Sin(phase / 25 + x / 5.0 + y / 4.0)));
                         }
-                        await WriteFrame(colors); phase += Math.Clamp(speed, 1, 4) * 1.2;
+                        Volatile.Write(ref litKeys, colors.Count(color => color.R != 0 || color.G != 0 || color.B != 0));
+                        await WriteFrame(colors); Interlocked.Increment(ref framesWritten); phase += Math.Clamp(speed, 1, 4) * 1.2;
                         if (!await timer.WaitForNextTickAsync(token)) break;
                     }
                 }
                 catch (OperationCanceledException) { }
-                catch (Exception ex) { Store.Log("Live effect: " + ex); Failed?.Invoke(ex); }
+                catch (Exception ex) { Store.Log("Software lighting: " + ex); Failed?.Invoke(ex); }
             }, token);
         }
         catch { await Stop(); throw; }
@@ -84,10 +97,12 @@ internal sealed class LiveEffects : IAsyncDisposable
     {
         if (audio == null) return;
         var format = audio.WaveFormat; int stride = format.BlockAlign;
+        bool floating = format.Encoding == WaveFormatEncoding.IeeeFloat || format is WaveFormatExtensible extended && extended.SubFormat == new Guid("00000003-0000-0010-8000-00aa00389b71");
+        double peakInput = 0;
         for (int i = 0; i + stride <= e.BytesRecorded; i += stride)
         {
-            float value = format.BitsPerSample == 32 ? BitConverter.ToSingle(e.Buffer, i) : format.BitsPerSample == 16 ? BitConverter.ToInt16(e.Buffer, i) / 32768f : 0;
-            if (!float.IsFinite(value)) value = 0;
+            float value = AudioSampleDecoder.ReadFrame(e.Buffer.AsSpan(i, stride), format.BitsPerSample, floating);
+            peakInput = Math.Max(peakInput, Math.Abs(value)); Interlocked.Increment(ref audioFramesReceived);
             samples[samplePosition++] = Math.Clamp(value, -1, 1);
             if (samplePosition != samples.Length) continue;
             var fft = samples.Select((x, n) => new Complex { X = (float)(x * FastFourierTransform.HannWindow(n, samples.Length)) }).ToArray();
@@ -97,10 +112,11 @@ internal sealed class LiveEffects : IAsyncDisposable
             {
                 int from = Math.Max(1, (int)Math.Pow(512, band / 17.0)), to = Math.Max(from + 1, (int)Math.Pow(512, (band + 1) / 17.0));
                 double peak = 0; for (int j = from; j < Math.Min(to, fft.Length / 2); j++) peak = Math.Max(peak, Math.Sqrt(fft[j].X * fft[j].X + fft[j].Y * fft[j].Y));
-                next[band] = Math.Max(old[band] * .8, Math.Clamp((20 * Math.Log10(peak + 1e-8) + 65) / 55, 0, 1));
+                next[band] = Math.Max(old[band] * .8, Math.Clamp((20 * Math.Log10(peak + 1e-9) + 85) / 70, 0, 1));
             }
             Volatile.Write(ref spectrum, next); samplePosition = 0;
         }
+        Volatile.Write(ref audioPeak, peakInput);
     }
     static Color Scale(Color color, double scale) => Color.FromArgb((int)(color.R * Math.Clamp(scale, 0, 1)), (int)(color.G * Math.Clamp(scale, 0, 1)), (int)(color.B * Math.Clamp(scale, 0, 1)));
     static Color Hue(double hue)
@@ -121,7 +137,15 @@ internal sealed class LiveEffects : IAsyncDisposable
     {
         cancellation?.Cancel(); if (worker != null) await worker; worker = null; cancellation?.Dispose(); cancellation = null;
         if (audio != null) { audio.DataAvailable -= AudioData; audio.StopRecording(); audio.Dispose(); audio = null; }
-        if (original != null) { var restore = original; original = null; await lighting.Exchange(2, Lighting.SettingsPayload(restore, false)); }
+        if (original != null)
+        {
+            var restore = original; original = null;
+            var current = Lighting.SettingsPayload(await lighting.ReadConfig(), false);
+            var saved = Lighting.SettingsPayload(restore, false);
+            Array.Copy(saved, 1, current, 1, 7); Array.Copy(saved, 9, current, 9, 51);
+            current[8] = (byte)((current[8] & ~2) | (saved[8] & 2));
+            await lighting.Exchange(2, current);
+        }
     }
     public async ValueTask DisposeAsync() => await Stop();
     [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr window);

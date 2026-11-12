@@ -4,7 +4,13 @@ using System.Runtime.InteropServices;
 
 namespace SukaControl;
 
-internal sealed class Lighting(bool allowRemote = true)
+internal interface ILighting
+{
+    Task<byte[]> Exchange(byte command, params byte[] payload);
+    Task<byte[]> ReadConfig();
+    Task Save();
+}
+internal sealed class Lighting(bool allowRemote = true) : ILighting
 {
     readonly SemaphoreSlim gate = new(1);
     public string? DevicePath { get; private set; }
@@ -74,14 +80,15 @@ internal sealed class Lighting(bool allowRemote = true)
     }
     public Task<byte[]> ReadConfig() => Exchange(1);
     public Task<byte[]> ReadKeyboard() => ReadConfig();
-    internal const byte PersistentSettings = 1;
-    internal const byte TemporarySettings = 0;
-    internal static byte[] SettingsPayload(byte[] state, bool persistent)
+    // This is the OEM common-settings selector, not the flash-save operation (command 0x05).
+    internal const byte NormalSettings = 1;
+    internal const byte DirectSettings = 0;
+    internal static byte[] SettingsPayload(byte[] state, bool normalMode)
     {
         if (state.Length < 64 || state[1] != 0x57 || state[2] != 0xab || state[3] != 1) throw new ArgumentException("Invalid lighting configuration.");
         var payload = state.Skip(4).Take(60).ToArray();
         // A software-driven per-pixel mode cannot run before the desktop is available.
-        payload[0] = persistent && payload[1] != 0xff ? PersistentSettings : TemporarySettings;
+        payload[0] = normalMode && payload[1] != 0xff ? NormalSettings : DirectSettings;
         return payload;
     }
 
@@ -91,7 +98,7 @@ internal sealed class Lighting(bool allowRemote = true)
         var config = await ReadConfig();
         // B21 common-setting encoder (OEM 2.1.1.413, 0x180192d80).
         // Match the OEM B21 CommonSetting encoder: ordinary settings use report[4] = 1.
-        var p = new byte[60]; p[0] = PersistentSettings; p[1] = effect == 9 ? (byte)11 : effect;
+        var p = new byte[60]; p[0] = NormalSettings; p[1] = effect == 9 ? (byte)11 : effect;
         p[2] = 0; p[3] = (byte)Math.Clamp(direction, 0, 1); p[4] = (byte)Math.Clamp(brightness, 0, 3); p[5] = (byte)Math.Clamp(speed, 1, 4); p[7] = 0; p[8] = (byte)(config[12] | 2);
         if (effect == 9) { p[2] = 0xff; p[14] = (byte)(color.R / 2); p[15] = (byte)(color.G / 2); p[16] = (byte)(color.B / 2); }
         await Exchange(2, p);
@@ -122,6 +129,11 @@ internal sealed class Lighting(bool allowRemote = true)
         payload[8] = enabled ? (byte)(payload[8] | bit) : (byte)(payload[8] & ~bit);
         await Exchange(2, payload); var after = await ReadConfig();
         if (((after[12] & bit) != 0) != enabled) throw new IOException("灯区开关回读不一致。");
+    }
+    public async Task Save()
+    {
+        // OEM B21PayloadWriter::SaveEffectParams sends 57 AB 05 with no payload.
+        await Exchange(5);
     }
 
     [StructLayout(LayoutKind.Sequential)] struct InterfaceData { public int Size; public Guid Guid; public uint Flags; public IntPtr Reserved; }

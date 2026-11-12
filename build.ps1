@@ -3,6 +3,15 @@ Push-Location $PSScriptRoot
 try {
     $releaseRoot=Join-Path $PSScriptRoot 'dist/SukaControl'
     $serviceRoot=Join-Path $PSScriptRoot 'dist/ServicePayload'
+    foreach($outputRoot in @($releaseRoot,$serviceRoot)){
+        $resolved=[IO.Path]::GetFullPath($outputRoot)
+        $expectedParent=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'dist'))
+        if((Split-Path $resolved -Parent) -ne $expectedParent -or (Split-Path $resolved -Leaf) -notin @('SukaControl','ServicePayload')){throw 'Invalid build output path'}
+        if(Test-Path -LiteralPath $resolved){
+            if((Get-Item -LiteralPath $resolved).Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Build output cannot be a linked directory'}
+            Remove-Item -LiteralPath $resolved -Recurse -Force
+        }
+    }
     dotnet publish src/MiControl/MiControl.csproj -c Release -r win-x64 --self-contained true -o $releaseRoot -p:DebugType=None -p:NuGetAudit=false
     if($LASTEXITCODE -ne 0){throw 'SukaControl build failed.'}
     dotnet publish src/SukaService/SukaService.csproj -c Release -r win-x64 --self-contained true -o $serviceRoot -p:DebugType=None -p:NuGetAudit=false
@@ -25,7 +34,7 @@ try {
         }
     }finally{$archive.Dispose()}
     $compiler=Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
-    & $compiler /nologo /target:winexe /platform:x64 /win32icon:src\MiControl\Assets\MiControl.ico /out:dist\SukaControl-Setup-0.2.7.exe /win32manifest:installer\setup.manifest /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll '/resource:installer\payload.zip,payload.zip' installer\Setup.cs
+    & $compiler /nologo /target:winexe /platform:x64 /win32icon:src\MiControl\Assets\MiControl.ico /out:dist\SukaControl-Setup-0.2.8.exe /win32manifest:installer\setup.manifest /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll '/resource:installer\payload.zip,payload.zip' installer\Setup.cs
     if($LASTEXITCODE -ne 0){throw 'Installer build failed.'}
-    Get-FileHash dist/SukaControl-Setup-0.2.7.exe -Algorithm SHA256 | Format-List
+    Get-FileHash dist/SukaControl-Setup-0.2.8.exe -Algorithm SHA256 | Format-List
 }finally{Pop-Location}

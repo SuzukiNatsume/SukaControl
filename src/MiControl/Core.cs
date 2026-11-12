@@ -16,12 +16,15 @@ internal static class Store
     public static bool Admin => new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
 }
 
+internal sealed record SoftwareLightingPreset(string Effect, int Argb, int Brightness, int Speed, bool Microphone, string? DisplayId);
+
 internal sealed class Preferences
 {
     public string F7Action { get; set; } = "copilot";
     public string Program { get; set; } = "";
     public bool CaptureF7 { get; set; } = true;
     public int Warmth { get; set; } = 35;
+    public SoftwareLightingPreset? SoftwareLighting { get; set; }
     public string Display { get; set; } = "";
     public Dictionary<string, string> OriginalProfiles { get; set; } = new();
     public Dictionary<string, ColorSnapshot> ColorBackups { get; set; } = new();

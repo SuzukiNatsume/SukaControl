@@ -12,7 +12,7 @@ using Microsoft.Win32;
 namespace SukaControl;
 
 internal record HardwareRequest(byte Command, bool Write = false, byte Value = 0, byte Value2 = 0, byte[]? Payload = null, long Ack = 0);
-internal record HardwareReply(bool Ok, byte[]? Data, string Model, string? Error = null, KeyState? Keys = null, KeyAction? Action = null, PerformancePolicy? Policy = null);
+internal record HardwareReply(bool Ok, byte[]? Data, string Model, string? Error = null, KeyState? Keys = null, KeyAction? Action = null, PerformancePolicy? Policy = null, LightingReadback? Lights = null);
 
 internal static class HardwareProtocol
 {
@@ -25,7 +25,7 @@ internal static class HardwareProtocol
         if (request.Command == 0x50)
         {
             if (!request.Write || request.Value2 != 0 || request.Ack != 0 || request.Payload is not { Length: <= 61 } p) return false;
-            return request.Value switch { 1 => p.Length == 0, 2 => p.Length == 60 && p[0] is 0 or 1 && p[4] <= 3 && (p[0] == 0 || p[1] != 0xff), 4 => p.Length == 61, 0xb => p.Length is 6 or 16 && p[0] <= 1, 0xc => p.Length == 1 && p[0] <= 1, 0xd => p.Length == 3 && p[0] <= 1 && p[1] is >= 1 and <= 3, _ => false };
+            return request.Value switch { 1 or 5 => p.Length == 0, 2 => p.Length == 60 && p[0] is 0 or 1 && p[4] <= 3 && (p[0] == 0 || p[1] != 0xff), 4 => p.Length == 61, 0xa or 0xc => p.Length == 1 && p[0] <= 1, 0xb => p.Length is 6 or 16 && p[0] <= 1, 0xd => p.Length == 3 && p[0] <= 1 && p[1] <= 3, _ => false };
         }
         if (request.Payload != null || request.Ack != 0) return false;
         if (!request.Write) return request.Value2 == 0 && (request.Command is 0 or 8 or 9 or 11 && request.Value == 0 || request.Command == 10 && request.Value is 1 or 2 or 6);
@@ -114,7 +114,7 @@ internal sealed class ControlService : ServiceBase
                             performance.RefreshPower();
                             var state = await keys.Read(request.Command == 0x41, request.Ack);
                             memory.Remember(state.State.PerformanceMode);
-                            reply = new(true, null, firmware.Model, Keys: state.State, Action: state.Action, Policy: performance.Policy);
+                            reply = new(true, null, firmware.Model, Keys: state.State, Action: state.Action, Policy: performance.Policy, Lights: keys.Lights);
                         }
                         else if (request.Command is 0x42 or 0x43)
                         {
@@ -124,7 +124,7 @@ internal sealed class ControlService : ServiceBase
                         else if (request.Command == 0x50)
                         {
                             var data = await lighting.Exchange(request.Value, request.Payload!);
-                            if (request.Value == 2) keys.InvalidateLight();
+                            if (request.Value is 2 or 0xb or 0xd) keys.InvalidateLight();
                             reply = new(true, data, firmware.Model);
                         }
                         else
@@ -231,6 +231,11 @@ internal static class ServiceInstaller
                 Directory.CreateDirectory(Path.GetDirectoryName(destination)!); File.Copy(file, destination, true);
             }
         }
+        // Remove dependencies of the retired desktop screen/audio effects on upgrade.
+        foreach (string obsolete in Directory.GetFiles(target, "NAudio*.dll", SearchOption.TopDirectoryOnly))
+            if (!File.Exists(Path.Combine(source, Path.GetFileName(obsolete)))) File.Delete(obsolete);
+        string oldAudioLicense = Path.Combine(target, "Licenses", "NAudio.txt");
+        if (File.Exists(oldAudioLicense) && !File.Exists(Path.Combine(source, "Licenses", "NAudio.txt"))) File.Delete(oldAudioLicense);
         // Executable and configuration must not be writable by a normal desktop process.
         var folderSecurity = new DirectorySecurity(); folderSecurity.SetAccessRuleProtection(true, false);
         folderSecurity.SetOwner(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null));
@@ -265,7 +270,7 @@ internal static class ServiceInstaller
         if (ping?.Ok != true) throw new IOException("SukaService did not become ready.");
         using (var key = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SukaControl"))
         {
-            key.SetValue("DisplayName", "SukaControl"); key.SetValue("DisplayVersion", "0.2.7"); key.SetValue("Publisher", "SuzukiNatsume"); key.SetValue("InstallLocation", target); key.SetValue("DisplayIcon", executable); key.SetValue("UninstallString", $"\"{executable}\" --uninstall"); key.SetValue("QuietUninstallString", $"\"{executable}\" --uninstall --quiet"); key.SetValue("NoModify", 1); key.SetValue("NoRepair", 1);
+            key.SetValue("DisplayName", "SukaControl"); key.SetValue("DisplayVersion", "0.2.8"); key.SetValue("Publisher", "SuzukiNatsume"); key.SetValue("InstallLocation", target); key.SetValue("DisplayIcon", executable); key.SetValue("UninstallString", $"\"{executable}\" --uninstall"); key.SetValue("QuietUninstallString", $"\"{executable}\" --uninstall --quiet"); key.SetValue("NoModify", 1); key.SetValue("NoRepair", 1);
         }
         CreateShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), "SukaControl.lnk"), executable);
         LegacyMigration.Complete(owner.Value);
