@@ -1,0 +1,1 @@
+const fs=require('fs'),s=fs.readFileSync('C:/Program Files/MI/Xiaomi G Command Center/2.1.1.413/dist/static/js/main.js','utf8');for(const t of ['KeepOn=','LightLevel','light:','color_type:','Breath=','effect_id:9','speed:5']){let i=-1,n=0;while((i=s.indexOf(t,i+1))>=0&&n++<5)console.log(t,s.slice(i-100,i+600));}

@@ -1,0 +1,10 @@
+using System;using System.IO;using System.Runtime.InteropServices;using System.Windows.Forms;
+class RawKeyTrace:NativeWindow{
+ [StructLayout(LayoutKind.Sequential)]struct Device{public ushort Page,Usage;public uint Flags;public IntPtr Target;}
+ [DllImport("user32.dll",SetLastError=true)]static extern bool RegisterRawInputDevices(Device[] devices,uint count,uint size);
+ [DllImport("user32.dll")]static extern uint GetRawInputData(IntPtr raw,uint command,IntPtr data,ref uint size,uint header);
+ string path=@"D:\Suzuki\Xiaomi\research\raw-fn-trace.txt";
+ RawKeyTrace(){CreateHandle(new CreateParams{Parent=new IntPtr(-3)});var devices=new[]{new Device{Page=1,Usage=6,Flags=0x100,Target=Handle},new Device{Page=0xff00,Usage=4,Flags=0x100,Target=Handle}};File.AppendAllText(path,"registered="+RegisterRawInputDevices(devices,2,(uint)Marshal.SizeOf(typeof(Device)))+Environment.NewLine);}
+ protected override void WndProc(ref Message m){if(m.Msg==0xff){uint size=0;uint header=(uint)(IntPtr.Size==8?24:16);GetRawInputData(m.LParam,0x10000003,IntPtr.Zero,ref size,header);IntPtr mem=Marshal.AllocHGlobal((int)size);try{if(GetRawInputData(m.LParam,0x10000003,mem,ref size,header)!=uint.MaxValue){int type=Marshal.ReadInt32(mem);int o=(int)header;string value=null;if(type==1){int vk=(ushort)Marshal.ReadInt16(mem,o+6);if(vk==0x47||vk<0x30||vk>0x5a)value="keyboard vk="+vk.ToString("X2")+" make="+Marshal.ReadInt16(mem,o).ToString("X2")+" flags="+Marshal.ReadInt16(mem,o+2).ToString("X2");}else if(type==2){int length=Marshal.ReadInt32(mem,o);byte[] bytes=new byte[Math.Min(length,64)];Marshal.Copy(mem+o+8,bytes,0,bytes.Length);if(bytes.Length<3||bytes[0]!=0x57||bytes[1]!=0xab||bytes[2]!=1)value="hid "+BitConverter.ToString(bytes);}if(value!=null)File.AppendAllText(path,DateTimeOffset.Now.ToString("O")+" "+value+Environment.NewLine);}}finally{Marshal.FreeHGlobal(mem);}}base.WndProc(ref m);}
+ [STAThread]static void Main(){var window=new RawKeyTrace();var timer=new Timer{Interval=60000};timer.Tick+=delegate{Application.ExitThread();};timer.Start();Application.Run();window.DestroyHandle();}
+}

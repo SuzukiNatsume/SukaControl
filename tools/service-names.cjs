@@ -1,0 +1,1 @@
+const fs=require('fs'),b=fs.readFileSync('C:/Program Files (x86)/Timi Personal Computing/MiService/4.1.1.188/MiDeviceService/MiDeviceServiceEntry.dll');const s=b.toString('latin1').match(/[\x20-\x7e]{5,}/g)||[];console.log(s.filter(x=>/OverDriver|OverDrive|MICommon|HID_EVENT|bitland|Inventec|WmiCommand|\.\?AV.*(Fan|Temperature|Graphic)/i.test(x)).join('\n'));

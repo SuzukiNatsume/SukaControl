@@ -1,0 +1,1 @@
+const fs=require('fs'),b=fs.readFileSync('C:/Program Files/MI/Xiaomi G Command Center/2.1.1.413/libXiaomiGCommandCenter.dll');console.log((b.toString('latin1').match(/[\x20-\x7e]{5,}/g)||[]).filter(x=>/bitland|graphic|SmartFan|cpu.*info/i.test(x)).join('\n'));

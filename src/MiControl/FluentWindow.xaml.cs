@@ -1,0 +1,338 @@
+using System.Diagnostics;
+using Microsoft.Win32;
+using W = System.Windows;
+using C = System.Windows.Controls;
+using M = System.Windows.Media;
+using S = System.Windows.Shapes;
+
+namespace SukaControl;
+
+internal partial class FluentWindow : W.Window
+{
+    readonly Firmware firmware = new();
+    readonly Lighting lighting = new();
+    readonly Telemetry telemetry = new();
+    readonly DisplayControl displayControl = new();
+    readonly Preferences preferences = Preferences.Load();
+    readonly LiveEffects live;
+    readonly System.Windows.Threading.DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(2) };
+    readonly System.Windows.Threading.DispatcherTimer keyTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
+    readonly System.Windows.Threading.DispatcherTimer warmthTimer = new() { Interval = TimeSpan.FromMilliseconds(150) };
+    readonly TaskCompletionSource hardwareReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public Task HardwareReady => hardwareReady.Task;
+    readonly NotifyIcon tray;
+    readonly Dictionary<string, C.TextBlock> readings = new();
+    readonly Dictionary<string, Trend> trends = new();
+    readonly Dictionary<string, C.StackPanel> pages = new();
+    readonly List<C.CheckBox> lightSwitches = new();
+    readonly C.TextBlock firmwareText = new(), lightingText = new(), profileText = new(), modeText = new(), graphicsText = new();
+    readonly C.ComboBox displays = new(), profileChoice = new(), modeChoice = new(), gfxChoice = new();
+    C.CheckBox? eyeSwitch, overdriveSwitch, fnSwitch, winSwitch;
+    C.Slider? keyboardBrightness;
+    int observedBrightness = -1;
+    bool? observedKeyboardEnabled;
+    bool keyPolling;
+    bool polling, exiting, updating;
+    bool performanceSelectionDirty, graphicsSelectionDirty;
+    int ticks;
+    DisplayTarget Display => displays.SelectedItem as DisplayTarget ?? throw new IOException("No display available.");
+    public FluentWindow()
+    {
+        InitializeComponent();
+        ApplyPalette(); SystemEvents.UserPreferenceChanged += ThemeChanged;
+        live = new(lighting); live.Failed += ex => Dispatcher.BeginInvoke(() => Status(L.Error(ex), true));
+        string[] ids = ["monitor", "lighting", "display", "shortcuts", "settings"], icons = ["\uE9D9", "\uE781", "\uE7F4", "\uE765", "\uE713"];
+        for (int i = 0; i < ids.Length; i++)
+        {
+            var row = new C.StackPanel { Orientation = C.Orientation.Horizontal };
+            row.Children.Add(new C.TextBlock { Text = icons[i], FontFamily = new("Segoe Fluent Icons"), FontSize = 18, Margin = new(0, 0, 14, 0), VerticalAlignment = W.VerticalAlignment.Center }); row.Children.Add(Text(L.T(ids[i])));
+            Navigation.Items.Add(new C.ListBoxItem { Content = row, Tag = ids[i], Style = (W.Style)Resources["NavigationItem"] });
+        }
+        BuildMonitor(); BuildLighting(); BuildDisplay(); BuildShortcuts(); BuildSettings();
+        Navigation.SelectionChanged += (_, _) => { if (Navigation.SelectedItem is C.ListBoxItem item) ShowPage((string)item.Tag); }; Navigation.SelectedIndex = 0;
+        var menu = new C.ContextMenu { PlacementTarget = this, Placement = System.Windows.Controls.Primitives.PlacementMode.MousePoint, FontFamily = FontFamily };
+        var openItem = new C.MenuItem { Header = L.T("showApp") }; openItem.Click += (_, _) => Restore();
+        var exitItem = new C.MenuItem { Header = L.T("exit") }; exitItem.Click += async (_, _) => await Exit();
+        menu.Items.Add(openItem); menu.Items.Add(exitItem);
+        menu.Opened += (_, _) => { if (W.PresentationSource.FromVisual(menu) is System.Windows.Interop.HwndSource source) SetForegroundWindow(source.Handle); };
+        tray = new() { Icon = LoadTrayIcon(), Text = "SukaControl", Visible = true }; tray.DoubleClick += (_, _) => Dispatcher.BeginInvoke(Restore);
+        tray.MouseUp += (_, e) => { if (e.Button == MouseButtons.Right) Dispatcher.BeginInvoke(() => menu.IsOpen = true); };
+        Loaded += async (_, _) => { await InitializeHardware(); timer.Start(); keyTimer.Start(); };
+        timer.Tick += async (_, _) => await Poll();
+        keyTimer.Tick += async (_, _) => await PollKeys();
+        warmthTimer.Tick += async (_, _) => { warmthTimer.Stop(); preferences.Save(); if (eyeSwitch?.IsChecked == true) await Execute(() => { displayControl.Eye(Display, true, preferences.Warmth); return Task.CompletedTask; }); };
+        Closing += (_, e) => { if (!exiting) { e.Cancel = true; Hide(); } };
+        Closed += (_, _) => { timer.Stop(); keyTimer.Stop(); warmthTimer.Stop(); menu.IsOpen = false; var icon = tray.Icon; tray.Dispose(); icon?.Dispose(); displayControl.Dispose(); firmware.Dispose(); SystemEvents.UserPreferenceChanged -= ThemeChanged; };
+        Activated += async (_, _) => { if (hardwareReady.Task.IsCompleted) await UpdateModes(); };
+    }
+    void ThemeChanged(object sender, UserPreferenceChangedEventArgs e) => Dispatcher.BeginInvoke(ApplyPalette);
+    static System.Drawing.Icon LoadTrayIcon()
+    {
+        using var theme = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+        bool lightTaskbar = theme?.GetValue("SystemUsesLightTheme") is int n && n != 0;
+        using var stream = W.Application.GetResourceStream(new Uri("/Assets/Tray" + (lightTaskbar ? "Light" : "Dark") + ".ico", UriKind.Relative)).Stream;
+        using var icon = new System.Drawing.Icon(stream, SystemInformation.SmallIconSize);
+        return (System.Drawing.Icon)icon.Clone();
+    }
+    void ApplyPalette()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"); bool light = key?.GetValue("AppsUseLightTheme") is int n && n != 0;
+        M.SolidColorBrush Brush(string color) => new((M.Color)M.ColorConverter.ConvertFromString(color));
+        Resources["MainText"] = Brush(light ? "#1A1A1A" : "#F5F5F5"); Resources["MutedText"] = Brush(light ? "#646464" : "#AEAEAE"); Resources["CardSurface"] = Brush(light ? "#CCFFFFFF" : "#C92C2C2C"); Resources["CardStroke"] = Brush(light ? "#0F000000" : "#19000000"); Resources["HoverSurface"] = Brush(light ? "#08000000" : "#0FFFFFFF"); Resources["SelectedSurface"] = Brush(light ? "#0D000000" : "#12FFFFFF"); Resources["Accent"] = W.SystemColors.AccentColorBrush;
+        if (tray != null) { var previous = tray.Icon; tray.Icon = LoadTrayIcon(); previous?.Dispose(); }
+    }
+    C.TextBlock Text(string value, double size = 14, bool muted = false)
+    {
+        var text = new C.TextBlock { Text = value, FontSize = size, TextWrapping = W.TextWrapping.Wrap, VerticalAlignment = W.VerticalAlignment.Center };
+        text.SetResourceReference(C.TextBlock.ForegroundProperty, muted ? "MutedText" : "MainText"); return text;
+    }
+    C.StackPanel Page(string id) { var panel = new C.StackPanel(); pages[id] = panel; return panel; }
+    C.StackPanel Horizontal(params W.UIElement[] children) { var row = new C.StackPanel { Orientation = C.Orientation.Horizontal, VerticalAlignment = W.VerticalAlignment.Center }; foreach (var child in children) row.Children.Add(child); return row; }
+    C.Button Button(string key, Func<Task> action) { var button = new C.Button { Content = L.T(key), VerticalAlignment = W.VerticalAlignment.Center }; button.Click += async (_, _) => await Execute(action); return button; }
+    C.Button Button(string key, Action action) => Button(key, () => { action(); return Task.CompletedTask; });
+    C.ComboBox Choice(IEnumerable<object> values, int width = 190) { var box = new C.ComboBox { Width = width, MinHeight = 34, VerticalAlignment = W.VerticalAlignment.Center, Margin = new(8, 0, 0, 0) }; foreach (var value in values) box.Items.Add(value); if (box.Items.Count > 0) box.SelectedIndex = 0; return box; }
+    C.CheckBox Switch(string name, bool value, Func<bool, Task> action)
+    {
+        var check = new C.CheckBox { IsChecked = value, Style = (W.Style)Resources["Switch"], ToolTip = L.T(name), Margin = new(12, 0, 0, 0) };
+        System.Windows.Automation.AutomationProperties.SetName(check, L.T(name));
+        check.Click += async (_, _) => { if (!updating) { bool requested = check.IsChecked == true; bool ok = await Execute(() => action(requested)); if (!ok) check.IsChecked = !requested; } }; return check;
+    }
+    C.Border Card(W.UIElement content, int padding = 16)
+    {
+        var card = new C.Border { CornerRadius = new(8), Padding = new(padding), BorderThickness = new(1), Margin = new(0, 0, 0, 6), Child = content };
+        card.SetResourceReference(C.Border.BackgroundProperty, "CardSurface"); card.SetResourceReference(C.Border.BorderBrushProperty, "CardStroke"); return card;
+    }
+    C.Border Setting(string title, string? description, W.UIElement control)
+    {
+        var grid = new C.Grid(); grid.ColumnDefinitions.Add(new() { Width = new(1, W.GridUnitType.Star) }); grid.ColumnDefinitions.Add(new() { Width = W.GridLength.Auto });
+        var labels = new C.StackPanel { Margin = new(0, 0, 18, 0), VerticalAlignment = W.VerticalAlignment.Center }; labels.Children.Add(Text(L.T(title)));
+        if (description is "restartNeeded" or "performanceShortcut") { var desc = Text(L.T(description), 12, true); desc.Margin = new(0, 5, 0, 0); labels.Children.Add(desc); }
+        grid.Children.Add(labels); C.Grid.SetColumn(control, 1); grid.Children.Add(control); return Card(grid);
+    }
+    void Section(C.StackPanel page, string key) { var title = Text(L.T(key), 14); title.FontWeight = W.FontWeights.SemiBold; title.Margin = new(2, 20, 0, 10); page.Children.Add(title); }
+    void ShowPage(string id) { PageTitle.Text = L.T(id); PageSubtitle.Text = id == "monitor" ? L.T("live") : id == "lighting" ? L.T("realtimeNote") : id == "display" ? L.T("profileNote") : id == "shortcuts" ? L.T("trayNote") : L.T("independent"); PageContent.Content = pages[id]; }
+    void BuildMonitor()
+    {
+        var page = Page("monitor"); var grid = new C.Grid { Margin = new(0, 0, 0, 10) };
+        for (int i = 0; i < 3; i++) grid.ColumnDefinitions.Add(new());
+        string[] keys = ["CPU", "GPU", "memory"];
+        for (int i = 0; i < keys.Length; i++)
+        {
+            var panel = new C.StackPanel(); panel.Children.Add(Text(L.T(keys[i]), 14, true)); var value = Text("—", 32); value.FontWeight = W.FontWeights.SemiBold; value.Margin = new(0, 8, 0, 4); readings[keys[i]] = value; panel.Children.Add(value);
+            var trend = new Trend { Height = 50, Margin = new(0, 6, 0, 0), Stroke = W.SystemColors.AccentColorBrush }; trends[keys[i]] = trend; panel.Children.Add(trend);
+            var card = Card(panel, 18); card.Margin = new(i == 0 ? 0 : 6, 0, i == 2 ? 0 : 6, 0); C.Grid.SetColumn(card, i); grid.Children.Add(card);
+        }
+        page.Children.Add(grid);
+        var sensors = new C.Primitives.UniformGrid { Columns = 3 };
+        foreach (string id in new[] { "cpuTemp", "gpuTemp", "gpuPower", "cpuFan", "gpuFan", "gpuClock" }) { var panel = new C.StackPanel { Margin = new(4, 7, 10, 7) }; panel.Children.Add(Text(L.T(id), 12, true)); var value = Text("—", 20); value.Margin = new(0, 5, 0, 0); readings[id] = value; panel.Children.Add(value); sensors.Children.Add(panel); }
+        page.Children.Add(Card(sensors));
+        Section(page, "performance"); var modes = new C.StackPanel { Orientation = C.Orientation.Horizontal };
+        foreach (var (id, code) in new[] { ("quiet", 2), ("balanced", 1), ("turbo", 3), ("full", 4) }) modeChoice.Items.Add(new Option(id, code));
+        modeChoice.Width = 150; modeChoice.SelectedIndex = -1; modes.Children.Add(modeChoice); modes.Children.Add(Button("apply", ApplyPerformance));
+        modeChoice.SelectionChanged += (_, _) => { if (!updating) performanceSelectionDirty = true; };
+        page.Children.Add(Setting("performance", "performanceShortcut", modes)); modeText.Margin = new(4, 2, 0, 10); modeText.SetResourceReference(C.TextBlock.ForegroundProperty, "MutedText"); page.Children.Add(modeText);
+        foreach (var (id, code) in new[] { ("hybrid", 0), ("direct", 1) }) gfxChoice.Items.Add(new Option(id, code)); gfxChoice.Width = 150; gfxChoice.SelectedIndex = -1;
+        gfxChoice.SelectionChanged += (_, _) => { if (!updating) graphicsSelectionDirty = true; };
+        page.Children.Add(Setting("graphics", "restartNeeded", Horizontal(gfxChoice, Button("apply", async () => { if (gfxChoice.SelectedItem is not Option selected) return; int mode = selected.Code; await Task.Run(() => firmware.SetGraphicsMode(mode)); graphicsSelectionDirty = false; graphicsText.Text = L.F("pendingGraphics", L.T(mode == 1 ? "direct" : "hybrid")); Restart(); }))));
+        graphicsText.Margin = new(4, 2, 0, 10); graphicsText.SetResourceReference(C.TextBlock.ForegroundProperty, "MutedText"); page.Children.Add(graphicsText);
+    }
+    void BuildLighting()
+    {
+        var page = Page("lighting");
+        for (int area = 0; area < 3; area++)
+        {
+            int index = area; string id = new[] { "keyboard", "logo", "bar" }[area];
+            var panel = new C.StackPanel(); var titleRow = new C.DockPanel(); var enable = Switch(id, true, async on => { if (index == 0) await live.Stop(); await lighting.Enable(index, on); }); lightSwitches.Add(enable); C.DockPanel.SetDock(enable, C.Dock.Right); titleRow.Children.Add(enable); var title = Text(L.T(id), 16); title.FontWeight = W.FontWeights.SemiBold; titleRow.Children.Add(title); panel.Children.Add(titleRow);
+            var choices = area == 0 ? new[] { new LightEffect("screenSync", -1), new LightEffect("audioSync", -2), new LightEffect("soft", -3), new LightEffect("rainbow", 7), new LightEffect("trigger", 5), new LightEffect("wavelet", 3), new LightEffect("colorwave", 6), new LightEffect("firefly", 10), new LightEffect("snake", 8), new LightEffect("wave", 1), new LightEffect("breath", 2), new LightEffect("keep", 9) } : area == 1 ? new[] { new LightEffect("keep", 9), new LightEffect("breath", 2), new LightEffect("gradient", 3), new LightEffect("linked", 4), new LightEffect("linkedBar", 5) } : new[] { new LightEffect("keep", 9), new LightEffect("breath", 2), new LightEffect("gradient", 3), new LightEffect("linked", 4) };
+            var effect = Choice(choices, 210); effect.SelectedIndex = area == 0 ? choices.Length - 1 : 0;
+            var bright = new C.Slider { Minimum = 0, Maximum = 3, Value = 2, TickFrequency = 1, IsSnapToTickEnabled = true, Width = 150, VerticalAlignment = W.VerticalAlignment.Center, Margin = new(8, 0, 0, 0) };
+            var speed = new C.Slider { Minimum = 1, Maximum = 4, Value = 2, TickFrequency = 1, IsSnapToTickEnabled = true, Width = 150, VerticalAlignment = W.VerticalAlignment.Center, Margin = new(8, 0, 0, 0) };
+            var direction = Choice(new[] { new Option("right", 1), new Option("left", 0), new Option("down", 1), new Option("up", 0) }, 150);
+            var audio = Choice(new[] { L.T("speaker"), L.T("microphone") }, 150);
+            Color color = Color.FromArgb(0, 120, 212); var colorButton = Button("colorPicker", () => { using var dialog = new ColorDialog { Color = color, FullOpen = true }; if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) color = dialog.Color; });
+            var effectRow = new C.Grid { Margin = new(0, 16, 0, 0) }; effectRow.ColumnDefinitions.Add(new() { Width = new(100) }); effectRow.ColumnDefinitions.Add(new()); effectRow.Children.Add(Text(L.T("effect"))); C.Grid.SetColumn(effect, 1); effectRow.Children.Add(effect); panel.Children.Add(effectRow);
+            var colorRow = new C.StackPanel { Orientation = C.Orientation.Horizontal, Margin = new(0, 10, 0, 0) }; colorRow.Children.Add(new C.TextBlock { Text = L.T("color"), Width = 100, VerticalAlignment = W.VerticalAlignment.Center }); colorRow.Children.Add(colorButton); panel.Children.Add(colorRow);
+            if (area == 0)
+            {
+                keyboardBrightness = bright;
+                foreach (var (label, control) in new (string, W.UIElement)[] { ("brightness", bright), ("speed", speed), ("direction", direction), ("audioSource", audio) }) { var row = new C.StackPanel { Orientation = C.Orientation.Horizontal, Margin = new(0, 10, 0, 0) }; row.Children.Add(new C.TextBlock { Text = L.T(label), Width = 100, VerticalAlignment = W.VerticalAlignment.Center }); row.Children.Add(control); panel.Children.Add(row); }
+            }
+            var apply = Button("apply", async () =>
+            {
+                var selected = (LightEffect)effect.SelectedItem;
+                if (index == 0) { await live.Stop(); if (selected.Code < 0) await live.Start(selected.Id, color, bright.Value / 3, (int)speed.Value, audio.SelectedIndex == 1, displays.SelectedItem is DisplayTarget d ? d.GdiName : null); else await lighting.Keyboard((byte)selected.Code, (int)bright.Value, (int)speed.Value, color, ((Option)direction.SelectedItem).Code); }
+                else await lighting.Accent(index == 1, (byte)selected.Code, color);
+            });
+            var actions = Horizontal(apply); actions.HorizontalAlignment = W.HorizontalAlignment.Right; actions.Margin = new(0, 16, 0, 0); if (area == 0) actions.Children.Insert(0, Button("stopEffect", () => live.Stop())); panel.Children.Add(actions); page.Children.Add(Card(panel, 20));
+        }
+    }
+    void BuildDisplay()
+    {
+        var page = Page("display"); displays.Width = 350; displays.MinHeight = 34; foreach (var display in DisplayControl.Displays()) displays.Items.Add(display); if (displays.Items.Count > 0) displays.SelectedIndex = 0;
+        displays.SelectionChanged += (_, _) => UpdateProfile(); page.Children.Add(Setting("displayTarget", null, displays));
+        eyeSwitch = Switch("eye", false, on => { displayControl.Eye(Display, on, preferences.Warmth); return Task.CompletedTask; }); page.Children.Add(Setting("eye", "eyeDescription", eyeSwitch));
+        var warmth = new C.Slider { Minimum = 0, Maximum = 100, Value = preferences.Warmth, Width = 300, TickFrequency = 10, VerticalAlignment = W.VerticalAlignment.Center };
+        warmth.ValueChanged += (_, _) => { preferences.Warmth = (int)warmth.Value; warmthTimer.Stop(); warmthTimer.Start(); }; page.Children.Add(Setting("warmth", null, warmth));
+        overdriveSwitch = Switch("overdrive", false, on => Task.Run(() => firmware.SetOverdrive(on))); page.Children.Add(Setting("overdrive", "overdriveDescription", overdriveSwitch));
+        Section(page, "profiles"); var panel = new C.StackPanel(); profileChoice.Width = 420; profileChoice.HorizontalAlignment = W.HorizontalAlignment.Left;
+        foreach (var path in DisplayControl.Profiles()) profileChoice.Items.Add(new Profile(path)); if (profileChoice.Items.Count > 0) profileChoice.SelectedIndex = 0;
+        panel.Children.Add(profileChoice); profileText.Margin = new(0, 12, 0, 16); profileText.TextWrapping = W.TextWrapping.Wrap; profileText.SetResourceReference(C.TextBlock.ForegroundProperty, "MutedText"); panel.Children.Add(profileText);
+        panel.Children.Add(Horizontal(Button("apply", () => { var display = Display; RememberProfile(display); displayControl.Dispose(); eyeSwitch.IsChecked = false; DisplayControl.ApplyProfile(display, ((Profile)profileChoice.SelectedItem).Path); UpdateProfile(); }), Button("restore", () => { if (preferences.ColorBackups.TryGetValue(Display.DeviceId, out var snapshot)) snapshot.Restore(); else if (preferences.OriginalProfiles.TryGetValue(Display.DeviceId, out var profile) && !string.IsNullOrEmpty(profile)) DisplayControl.ApplyProfile(Display, ProfilePath(profile)); else throw new InvalidOperationException(L.T("noOriginalProfile")); UpdateProfile(); }), Button("systemColor", () => Process.Start(new ProcessStartInfo("colorcpl.exe") { UseShellExecute = true })))); page.Children.Add(Card(panel, 20)); UpdateProfile();
+    }
+    void BuildShortcuts()
+    {
+        var page = Page("shortcuts");
+        fnSwitch = Switch("fnLock", false, locked => Task.Run(() => firmware.SetFnLocked(locked))); winSwitch = Switch("winLock", false, locked => Task.Run(() => firmware.SetWinLocked(locked)));
+        page.Children.Add(Setting("fnLock", "fnLockNote", fnSwitch)); page.Children.Add(Setting("winLock", "winLockNote", winSwitch));
+        Section(page, "captureF7"); page.Children.Add(Setting("captureF7", null, Switch("captureF7", preferences.CaptureF7, on => { preferences.CaptureF7 = on; preferences.Save(); return Task.CompletedTask; })));
+        string[] ids = ["copilot", "toggleEye", "launchProgram", "nothing"]; var action = Choice(ids.Select((id, i) => new Option(id, i)), 270); int selected = Array.IndexOf(ids, preferences.F7Action); action.SelectedIndex = selected >= 0 ? selected : 0; preferences.F7Action = ids[action.SelectedIndex];
+        action.SelectionChanged += (_, _) => { preferences.F7Action = ((Option)action.SelectedItem).Id; preferences.Save(); }; page.Children.Add(Setting("action", null, action));
+        var path = new C.TextBox { Text = preferences.Program, Width = 330, MinHeight = 34, VerticalContentAlignment = W.VerticalAlignment.Center };
+        path.TextChanged += (_, _) => { preferences.Program = path.Text; preferences.Save(); }; page.Children.Add(Setting("program", null, Horizontal(path, Button("browse", () => { var file = new Microsoft.Win32.OpenFileDialog { Filter = "Program|*.exe;*.lnk" }; if (file.ShowDialog(this) == true) path.Text = file.FileName; }))));
+        Section(page, "background"); page.Children.Add(Setting("startup", null, Switch("startup", StartupTask.Enabled, enabled => { StartupTask.Set(enabled); return Task.CompletedTask; })));
+    }
+    void BuildSettings()
+    {
+        var page = Page("settings"); page.Children.Add(Setting("language", "automaticLanguage", Text(L.Language == "zh-CN" ? "简体中文" : L.Language == "zh-TW" ? "繁體中文" : L.Language == "ja" ? "日本語" : "English")));
+        Section(page, "connections"); page.Children.Add(Setting("firmware", null, firmwareText)); page.Children.Add(Setting("lighting", null, lightingText));
+        var actions = Horizontal(Button("refresh", InitializeHardware), Button("diagnostics", async () => { string path = await Diagnostics.Write(); Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true }); }), Button("logs", () => Process.Start(new ProcessStartInfo(Store.Root) { UseShellExecute = true }))); actions.Margin = new(0, 12, 0, 12); page.Children.Add(actions);
+        if (!HardwareClient.Installed) page.Children.Add(Setting("installService", "serviceNote", Button("installService", async () => { var process = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--install-service --owner-sid " + System.Security.Principal.WindowsIdentity.GetCurrent().User!.Value) { UseShellExecute = true, Verb = "runas" }); if (process != null) await process.WaitForExitAsync(); if (!HardwareClient.Installed) throw new IOException("Service install failed."); await InitializeHardware(); })));
+        Section(page, "about");
+        var about = new C.StackPanel(); about.Children.Add(Text("SukaControl 0.2.2"));
+        var author = new System.Windows.Documents.Hyperlink(new System.Windows.Documents.Run("SuzukiNatsume")) { NavigateUri = new Uri("https://github.com/SuzukiNatsume") };
+        author.RequestNavigate += (_, e) => { Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true }); e.Handled = true; };
+        var link = Text(""); link.Margin = new(0, 8, 0, 0); link.Inlines.Add(author); about.Children.Add(link); page.Children.Add(Card(about));
+    }
+    async Task InitializeHardware()
+    {
+        try { await Task.Run(firmware.Connect); firmwareText.Text = L.T("connected"); } catch (Exception ex) { firmwareText.Text = L.Error(ex); }
+        try { lighting.Detect(); var config = await lighting.ReadConfig(); for (int i = 0; i < 3; i++) lightSwitches[i].IsChecked = (config[12] & new[] { 2, 16, 32 }[i]) != 0; lightingText.Text = L.T("connected"); } catch (Exception ex) { lightingText.Text = L.Error(ex); }
+        await UpdateModes(); await PollKeys(); await Poll(); Status(L.T("ready")); hardwareReady.TrySetResult();
+    }
+    async Task UpdateModes()
+    {
+        try
+        {
+            var values = await Task.Run(() => (mode: firmware.Performance(), od: firmware.Overdrive(), graphics: firmware.GraphicsMode()));
+            updating = true;
+            UpdatePerformanceReadback(values.mode);
+            if (!graphicsSelectionDirty) gfxChoice.SelectedIndex = values.graphics is 0 or 1 ? values.graphics : -1;
+            if (overdriveSwitch != null) overdriveSwitch.IsChecked = values.od;
+        }
+        catch (Exception ex) { modeText.Text = L.Error(ex); }
+        finally { updating = false; }
+    }
+    async Task PollKeys()
+    {
+        if (keyPolling || exiting || !HardwareClient.Installed) return;
+        keyPolling = true;
+        try
+        {
+            var reply = await Task.Run(() => HardwareClient.Send(new(0x40)));
+            if (!reply.Ok || reply.Keys == null) return;
+            var state = reply.Keys;
+            updating = true;
+            if (state.PerformanceMode > 0) UpdatePerformanceReadback(state.PerformanceMode);
+            if (fnSwitch != null) fnSwitch.IsChecked = state.FnLocked;
+            if (winSwitch != null) winSwitch.IsChecked = state.WinLocked;
+            if (keyboardBrightness != null && state.Brightness >= 0 && state.Brightness != observedBrightness && !keyboardBrightness.IsMouseCaptureWithin)
+            { keyboardBrightness.Value = state.Brightness; observedBrightness = state.Brightness; }
+            if (state.Brightness >= 0 && observedKeyboardEnabled != state.KeyboardEnabled)
+            { lightSwitches[0].IsChecked = state.KeyboardEnabled; observedKeyboardEnabled = state.KeyboardEnabled; }
+        }
+        catch (Exception ex) { Store.Log("Key state: " + ex.Message); }
+        finally { updating = false; keyPolling = false; }
+    }
+    public Task RunF7() => F7();
+    void UpdatePerformanceReadback(int mode)
+    {
+        if (!performanceSelectionDirty) modeChoice.SelectedIndex = mode switch { 2 => 0, 1 => 1, 3 => 2, 4 => 3, _ => -1 };
+        modeText.Text = L.T(mode switch { 2 => "quiet", 1 => "balanced", 3 => "turbo", 4 => "full", _ => "unavailable" });
+    }
+    async Task Poll()
+    {
+        if (polling || exiting) return; polling = true;
+        try
+        {
+            var s = await Task.Run(() => telemetry.Read(firmware));
+            string Value(double? value, string unit) => value is null ? "—" : $"{value:0.#} {unit}";
+            foreach (var (key, value) in new (string, double?)[] { ("CPU", s.Cpu), ("GPU", s.GpuUsage), ("memory", s.Memory) }) { readings[key].Text = Value(value, "%"); trends[key].Add(value); }
+            readings["cpuTemp"].Text = Value(s.CpuTemp, "°C"); readings["gpuTemp"].Text = Value(s.GpuTemp, "°C"); readings["gpuPower"].Text = Value(s.GpuPower, "W"); readings["gpuClock"].Text = Value(s.GpuClock, "MHz"); readings["cpuFan"].Text = Value(s.CpuFan, "RPM"); readings["gpuFan"].Text = Value(s.GpuFan, "RPM");
+            if (++ticks % 5 == 0) await UpdateModes();
+        }
+        catch (Exception ex) { Status(L.Error(ex), true); }
+        finally { polling = false; }
+    }
+    async Task F7() => await Execute(async () =>
+    {
+        switch (preferences.F7Action)
+        {
+            case "copilot": using (var protocol = Registry.ClassesRoot.OpenSubKey("ms-copilot")) Process.Start(new ProcessStartInfo(protocol != null ? "ms-copilot:" : "https://copilot.microsoft.com/") { UseShellExecute = true }); break;
+            case "toggleEye": ToggleEye(); break;
+            case "launchProgram": if (!File.Exists(preferences.Program)) { Status(L.T("chooseProgram"), true); return; } Process.Start(new ProcessStartInfo(preferences.Program) { UseShellExecute = true }); break;
+        }
+    });
+    async Task ApplyPerformance()
+    {
+        // Read WPF controls before leaving the dispatcher thread.
+        if (modeChoice.SelectedItem is not Option selected) return;
+        int mode = selected.Code;
+        await Task.Run(() => firmware.SetPerformance(mode));
+        performanceSelectionDirty = false;
+        await UpdateModes();
+    }
+    internal async Task<Dictionary<string, object?>> TestPerformanceUI()
+    {
+        var result = new Dictionary<string, object?>(); int before = await Task.Run(firmware.Performance);
+        try
+        {
+            int target = before == 2 ? 1 : 2;
+            modeChoice.SelectedItem = modeChoice.Items.Cast<Option>().Single(option => option.Code == target);
+            await ApplyPerformance();
+            int actual = await Task.Run(firmware.Performance);
+            result["before"] = before; result["requested"] = target; result["actual"] = actual;
+            result["passed"] = actual == target;
+        }
+        catch (Exception ex) { result["passed"] = false; result["error"] = ex.ToString(); }
+        finally
+        {
+            await Task.Run(() => firmware.SetPerformance(before)); performanceSelectionDirty = false; await UpdateModes();
+            result["restored"] = await Task.Run(firmware.Performance) == before;
+        }
+        return result;
+    }
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
+    void ToggleEye() { displayControl.Eye(Display, !displayControl.EyeEnabled, preferences.Warmth); if (eyeSwitch != null) eyeSwitch.IsChecked = displayControl.EyeEnabled; }
+    void RememberProfile(DisplayTarget display) { if (!preferences.ColorBackups.ContainsKey(display.DeviceId)) preferences.ColorBackups[display.DeviceId] = ColorSnapshot.Capture(display); if (!preferences.OriginalProfiles.ContainsKey(display.DeviceId)) preferences.OriginalProfiles[display.DeviceId] = DisplayControl.CurrentProfile(display); preferences.Save(); }
+    static string ProfilePath(string profile) => Path.IsPathRooted(profile) ? profile : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "spool", "drivers", "color", profile);
+    void UpdateProfile() { if (displays.SelectedItem is DisplayTarget display) profileText.Text = L.F("currentProfile", DisplayControl.CurrentProfile(display) is { Length: > 0 } p ? p : L.T("systemDefault")); }
+    void Restart() { if (W.MessageBox.Show(this, L.T("restartConfirm"), L.T("restart"), W.MessageBoxButton.YesNo, W.MessageBoxImage.Question) == W.MessageBoxResult.Yes) Process.Start(new ProcessStartInfo("shutdown.exe", "/r /t 0") { UseShellExecute = false, CreateNoWindow = true }); }
+    public void Restore() { Show(); WindowState = W.WindowState.Normal; Activate(); }
+    internal void SelectPage(string id) { foreach (C.ListBoxItem item in Navigation.Items) if ((string)item.Tag == id) { Navigation.SelectedItem = item; break; } }
+    public async Task Exit(bool restoreColor = false) { exiting = true; timer.Stop(); keyTimer.Stop(); warmthTimer.Stop(); try { await live.Stop(); } catch (Exception ex) { Store.Log(ex.ToString()); } if (restoreColor) foreach (var snapshot in preferences.ColorBackups.Values) snapshot.Restore(); Close(); }
+    async Task<bool> Execute(Func<Task> action)
+    {
+        Status(L.T("working")); try { await action(); Status(L.T("done")); return true; } catch (Exception ex) { Status(ex is InvalidOperationException ? ex.Message : L.Error(ex), true); return false; }
+    }
+    void Status(string text, bool error = false) { StatusText.Text = error ? L.T("error") + " · " + text : text; Store.Log(text); }
+    internal void SavePreview(string path)
+    {
+        var background = (M.SolidColorBrush)Resources["MainText"]; bool light = background.Color.R < 100;
+        var drawing = new M.DrawingVisual(); using (var context = drawing.RenderOpen()) { context.DrawRectangle(new M.SolidColorBrush(light ? M.Color.FromRgb(243, 243, 243) : M.Color.FromRgb(32, 32, 32)), null, new W.Rect(0, 0, ActualWidth, ActualHeight)); context.DrawRectangle(new M.VisualBrush(this), null, new W.Rect(0, 0, ActualWidth, ActualHeight)); }
+        var bitmap = new M.Imaging.RenderTargetBitmap((int)ActualWidth, (int)ActualHeight, 96, 96, M.PixelFormats.Pbgra32); bitmap.Render(drawing); var encoder = new M.Imaging.PngBitmapEncoder(); encoder.Frames.Add(M.Imaging.BitmapFrame.Create(bitmap)); using var stream = File.Create(path); encoder.Save(stream);
+    }
+    sealed record Option(string Id, int Code) { public override string ToString() => L.T(Id); }
+    sealed record LightEffect(string Id, int Code) { public override string ToString() => L.T(Id); }
+    sealed record Profile(string Path) { public override string ToString() => System.IO.Path.GetFileName(Path); }
+    sealed class Trend : W.FrameworkElement
+    {
+        readonly Queue<double?> values = new(); public M.Brush Stroke { get; set; } = M.Brushes.DodgerBlue;
+        public void Add(double? value) { values.Enqueue(value); while (values.Count > 45) values.Dequeue(); InvalidateVisual(); }
+        protected override void OnRender(M.DrawingContext dc)
+        {
+            base.OnRender(dc); var values = this.values.ToArray(); if (values.Length < 2) return; var geometry = new M.StreamGeometry();
+            using (var context = geometry.Open()) { bool started = false; for (int i = 0; i < values.Length; i++) { if (values[i] == null) { started = false; continue; } var point = new W.Point(i * ActualWidth / 44, ActualHeight - Math.Clamp(values[i]!.Value, 0, 100) * ActualHeight / 100); if (started) context.LineTo(point, true, false); else { context.BeginFigure(point, false, false); started = true; } } }
+            dc.DrawGeometry(null, new M.Pen(Stroke, 1.6), geometry);
+        }
+    }
+}

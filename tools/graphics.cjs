@@ -1,0 +1,1 @@
+const fs=require('fs'),s=fs.readFileSync('C:/Program Files/MI/Xiaomi G Command Center/2.1.1.413/dist/static/js/main.js','utf8');for(const t of ['GraphicMode','graphic_mode','Independent','Discrete','Mixed']){let i=-1,n=0;while((i=s.indexOf(t,i+1))>=0&&n++<8)console.log(t,s.slice(Math.max(0,i-180),i+600));}

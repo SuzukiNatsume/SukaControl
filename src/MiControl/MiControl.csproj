@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <Version>0.2.2</Version>
+    <AssemblyName>SukaControl</AssemblyName>
+    <RootNamespace>SukaControl</RootNamespace>
+    <ApplicationIcon>Assets\MiControl.ico</ApplicationIcon>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <NoWarn>$(NoWarn);WPF0001</NoWarn>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Core.cs;Native.cs;Lighting.cs;HardwareService.cs;KeyService.cs;SessionAgent.cs;UserSession.cs;Language.cs" />
+    <ProjectReference Include="..\Suka.Core\Suka.Core.csproj" />
+    <Resource Include="Assets\*.ico" />
+    <Content Include="Licenses\**\*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="System.Management" Version="11.0.0" />
+    <Content Include="Profiles\xiaomi_*.icc" Link="Profiles\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>

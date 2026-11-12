@@ -1,0 +1,11 @@
+src/**/bin/
+src/**/obj/
+dist/
+installer/payload.zip
+backup/
+research/
+*.user
+.vs/
+**/__pycache__/
+*.pyc
+*.log
