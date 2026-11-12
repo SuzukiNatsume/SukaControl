@@ -13,6 +13,9 @@ internal static class L
     public static IEnumerable<KeyValuePair<string, string>> Entries => Text.Select(p => new KeyValuePair<string, string>(p.Key, p.Value[Index]));
     static readonly Dictionary<string, string[]> Text = new()
     {
+        ["restorePerformance"] = ["启动时恢复上次性能模式", "啟動時恢復上次效能模式", "Restore previous performance mode at startup", "起動時に前回のパフォーマンスモードを復元"],
+        ["acFullSpeed"] = ["接通电源时自动全速", "接通電源時自動全速", "Automatically use Full speed on AC power", "AC 電源接続時に自動でフルスピード"],
+        ["acFullSpeedHint"] = ["已接通电源时开启会立即切换；接通电源启动时也会应用。", "已接通電源時開啟會立即切換；接通電源啟動時也會套用。", "Enabling this while plugged in applies Full speed immediately, including at startup on AC power.", "AC 接続中に有効にすると直ちに切り替わり、AC 接続での起動時にも適用されます。"],
         ["monitor"] = ["监控", "監控", "Overview", "モニター"],
         ["lighting"] = ["灯效", "燈效", "Lighting", "ライティング"],
         ["display"] = ["显示与色彩", "顯示與色彩", "Display & color", "画面と色"],

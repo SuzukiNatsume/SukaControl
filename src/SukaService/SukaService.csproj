@@ -1,4 +1,4 @@
 <Project Sdk="Microsoft.NET.Sdk">
- <PropertyGroup><OutputType>WinExe</OutputType><TargetFramework>net10.0-windows</TargetFramework><UseWindowsForms>true</UseWindowsForms><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings><Version>0.2.5</Version><ApplicationIcon>..\MiControl\Assets\MiControl.ico</ApplicationIcon></PropertyGroup>
+ <PropertyGroup><OutputType>WinExe</OutputType><TargetFramework>net10.0-windows</TargetFramework><UseWindowsForms>true</UseWindowsForms><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings><Version>0.2.6</Version><ApplicationIcon>..\MiControl\Assets\MiControl.ico</ApplicationIcon></PropertyGroup>
  <ItemGroup><ProjectReference Include="..\Suka.Core\Suka.Core.csproj" /></ItemGroup>
 </Project>

@@ -30,6 +30,8 @@ internal partial class FluentWindow : W.Window
     readonly C.TextBlock firmwareText = new(), lightingText = new(), profileText = new(), modeText = new(), graphicsText = new();
     readonly C.ComboBox displays = new(), profileChoice = new(), modeChoice = new(), gfxChoice = new();
     C.CheckBox? eyeSwitch, overdriveSwitch, fnSwitch, winSwitch;
+    C.CheckBox? restorePerformanceSwitch, acFullSpeedSwitch;
+    bool policySaving;
     C.Slider? keyboardBrightness;
     int observedBrightness = -1;
     bool? observedKeyboardEnabled;
@@ -183,6 +185,12 @@ internal partial class FluentWindow : W.Window
         modeChoice.Width = 150; modeChoice.SelectedIndex = -1; modes.Children.Add(modeChoice); modes.Children.Add(Button("apply", ApplyPerformance));
         modeChoice.SelectionChanged += (_, _) => { if (!updating) performanceSelectionDirty = true; };
         page.Children.Add(Setting("performance", "performanceShortcut", modes)); modeText.Margin = new(4, 2, 0, 10); modeText.SetResourceReference(C.TextBlock.ForegroundProperty, "MutedText"); page.Children.Add(modeText);
+        restorePerformanceSwitch = Switch("restorePerformance", true, enabled => SavePerformancePolicy(1, enabled));
+        acFullSpeedSwitch = Switch("acFullSpeed", false, enabled => SavePerformancePolicy(2, enabled));
+        acFullSpeedSwitch.ToolTip = L.T("acFullSpeedHint");
+        restorePerformanceSwitch.IsEnabled = acFullSpeedSwitch.IsEnabled = false;
+        page.Children.Add(Setting("restorePerformance", null, restorePerformanceSwitch));
+        page.Children.Add(Setting("acFullSpeed", null, acFullSpeedSwitch));
         foreach (var (id, code) in new[] { ("hybrid", 0), ("direct", 1) }) gfxChoice.Items.Add(new Option(id, code)); gfxChoice.Width = 150; gfxChoice.SelectedIndex = -1;
         gfxChoice.SelectionChanged += (_, _) => { if (!updating) graphicsSelectionDirty = true; };
         page.Children.Add(Setting("graphics", "restartNeeded", Horizontal(gfxChoice, Button("apply", async () => { if (gfxChoice.SelectedItem is not Option selected) return; int mode = selected.Code; await Task.Run(() => firmware.SetGraphicsMode(mode)); graphicsSelectionDirty = false; graphicsText.Text = L.F("pendingGraphics", L.T(mode == 1 ? "direct" : "hybrid")); Restart(); }))));
@@ -251,7 +259,7 @@ internal partial class FluentWindow : W.Window
         var actions = Horizontal(Button("refresh", InitializeHardware), Button("diagnostics", async () => { string path = await Diagnostics.Write(); Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true }); }), Button("logs", () => Process.Start(new ProcessStartInfo(Store.Root) { UseShellExecute = true }))); actions.Margin = new(0, 12, 0, 12); page.Children.Add(actions);
         if (!HardwareClient.Installed) page.Children.Add(Setting("installService", "serviceNote", Button("installService", async () => { var process = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--install-service --owner-sid " + System.Security.Principal.WindowsIdentity.GetCurrent().User!.Value) { UseShellExecute = true, Verb = "runas" }); if (process != null) await process.WaitForExitAsync(); if (!HardwareClient.Installed) throw new IOException("Service install failed."); await InitializeHardware(); })));
         Section(page, "about");
-        var about = new C.StackPanel(); about.Children.Add(Text("SukaControl 0.2.5"));
+        var about = new C.StackPanel(); about.Children.Add(Text("SukaControl 0.2.6"));
         var author = new System.Windows.Documents.Hyperlink(new System.Windows.Documents.Run("SuzukiNatsume")) { NavigateUri = new Uri("https://github.com/SuzukiNatsume") };
         author.RequestNavigate += (_, e) => { Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true }); e.Handled = true; };
         var link = Text(""); link.Margin = new(0, 8, 0, 0); link.Inlines.Add(author); about.Children.Add(link); page.Children.Add(Card(about));
@@ -285,6 +293,11 @@ internal partial class FluentWindow : W.Window
             if (!reply.Ok || reply.Keys == null) return;
             var state = reply.Keys;
             updating = true;
+            if (!policySaving && reply.Policy is { } policy && restorePerformanceSwitch != null && acFullSpeedSwitch != null)
+            {
+                restorePerformanceSwitch.IsChecked = policy.RestoreOnStartup; acFullSpeedSwitch.IsChecked = policy.FullSpeedOnAC;
+                restorePerformanceSwitch.IsEnabled = acFullSpeedSwitch.IsEnabled = true;
+            }
             if (state.PerformanceMode > 0) UpdatePerformanceReadback(state.PerformanceMode);
             if (fnSwitch != null) fnSwitch.IsChecked = state.FnLocked;
             if (winSwitch != null) winSwitch.IsChecked = state.WinLocked;
@@ -297,6 +310,18 @@ internal partial class FluentWindow : W.Window
         finally { updating = false; keyPolling = false; }
     }
     public Task RunF7() => F7();
+    async Task SavePerformancePolicy(byte option, bool enabled)
+    {
+        policySaving = true;
+        restorePerformanceSwitch!.IsEnabled = acFullSpeedSwitch!.IsEnabled = false;
+        try
+        {
+            var reply = await Task.Run(() => HardwareClient.Send(new(0x43, true, option, enabled ? (byte)1 : (byte)0)));
+            if (!reply.Ok) throw new IOException(reply.Error);
+        }
+        finally { policySaving = false; restorePerformanceSwitch.IsEnabled = acFullSpeedSwitch.IsEnabled = true; }
+        await UpdateModes();
+    }
     void UpdatePerformanceReadback(int mode)
     {
         if (!performanceSelectionDirty) modeChoice.SelectedIndex = mode switch { 2 => 0, 1 => 1, 3 => 2, 4 => 3, _ => -1 };

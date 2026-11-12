@@ -12,13 +12,15 @@ using Microsoft.Win32;
 namespace SukaControl;
 
 internal record HardwareRequest(byte Command, bool Write = false, byte Value = 0, byte Value2 = 0, byte[]? Payload = null, long Ack = 0);
-internal record HardwareReply(bool Ok, byte[]? Data, string Model, string? Error = null, KeyState? Keys = null, KeyAction? Action = null);
+internal record HardwareReply(bool Ok, byte[]? Data, string Model, string? Error = null, KeyState? Keys = null, KeyAction? Action = null, PerformancePolicy? Policy = null);
 
 internal static class HardwareProtocol
 {
     internal const string PipeName = "SukaService.Hardware.v1";
     public static bool Allowed(HardwareRequest request)
     {
+        if (request.Command == 0x42) return !request.Write && request.Value == 0 && request.Value2 == 0 && request.Payload == null && request.Ack == 0;
+        if (request.Command == 0x43) return request.Write && request.Value is 1 or 2 && request.Value2 is 0 or 1 && request.Payload == null && request.Ack == 0;
         if (request.Command is 0x40 or 0x41) return !request.Write && request.Value == 0 && request.Value2 == 0 && request.Payload == null && request.Ack >= 0 && (request.Command == 0x41 || request.Ack == 0);
         if (request.Command == 0x50)
         {
@@ -60,10 +62,20 @@ internal sealed class ControlService : ServiceBase
     readonly CancellationTokenSource stop = new();
     Task? worker;
     readonly object lifecycleGate = new();
-    PerformanceMemory? performanceMemory;
-    public ControlService() { ServiceName = "SukaService"; CanStop = true; CanShutdown = true; AutoLog = false; }
+    PerformanceAutomation? automation;
+    public ControlService() { ServiceName = "SukaService"; CanStop = true; CanShutdown = true; CanHandlePowerEvent = true; AutoLog = false; }
     protected override void OnStart(string[] args) { worker = Task.Run(() => Serve(stop.Token)); }
-    void CapturePerformance() { lock (lifecycleGate) performanceMemory?.Finish(); }
+    void CapturePerformance() { lock (lifecycleGate) automation?.Finish(); }
+    protected override bool OnPowerEvent(PowerBroadcastStatus powerStatus)
+    {
+        try
+        {
+            if (powerStatus is PowerBroadcastStatus.PowerStatusChange or PowerBroadcastStatus.ResumeAutomatic or PowerBroadcastStatus.ResumeSuspend)
+                lock (lifecycleGate) automation?.RefreshPower();
+        }
+        catch (Exception ex) { Store.Log("Power notification: " + ex.Message); }
+        return true;
+    }
     protected override void OnShutdown() { CapturePerformance(); stop.Cancel(); worker?.Wait(TimeSpan.FromSeconds(5)); base.OnShutdown(); }
     protected override void OnStop() { CapturePerformance(); stop.Cancel(); worker?.Wait(TimeSpan.FromSeconds(5)); }
     async Task Serve(CancellationToken token)
@@ -77,8 +89,10 @@ internal sealed class ControlService : ServiceBase
             acl.AddAccessRule(new(ownerSid, PipeAccessRights.ReadWrite, AccessControlType.Allow));
             using var firmware = new Firmware(false); firmware.Connect();
             var memory = new PerformanceMemory(Path.Combine(ServiceInstaller.DataDirectory, "performance-state.json"), firmware.Performance, firmware.SetPerformance, Store.Log);
-            memory.Restore();
-            lock (lifecycleGate) performanceMemory = memory;
+            var performance = new PerformanceAutomation(Path.Combine(ServiceInstaller.DataDirectory, "performance-options.json"), memory, firmware.Performance, firmware.SetPerformance,
+                () => System.Windows.Forms.SystemInformation.PowerStatus.PowerLineStatus switch { System.Windows.Forms.PowerLineStatus.Online => true, System.Windows.Forms.PowerLineStatus.Offline => false, _ => (bool?)null }, Store.Log);
+            performance.Start();
+            lock (lifecycleGate) automation = performance;
             try
             {
             var lighting = new Lighting(false);
@@ -97,9 +111,15 @@ internal sealed class ControlService : ServiceBase
                         if (!HardwareProtocol.Allowed(request)) throw new UnauthorizedAccessException("Unsupported hardware operation.");
                         if (request.Command is 0x40 or 0x41)
                         {
+                            performance.RefreshPower();
                             var state = await keys.Read(request.Command == 0x41, request.Ack);
                             memory.Remember(state.State.PerformanceMode);
-                            reply = new(true, null, firmware.Model, Keys: state.State, Action: state.Action);
+                            reply = new(true, null, firmware.Model, Keys: state.State, Action: state.Action, Policy: performance.Policy);
+                        }
+                        else if (request.Command is 0x42 or 0x43)
+                        {
+                            if (request.Command == 0x43) { performance.Set(request.Value, request.Value2 == 1); keys.InvalidatePerformance(); }
+                            reply = new(true, null, firmware.Model, Policy: performance.Policy);
                         }
                         else if (request.Command == 0x50)
                         {
@@ -109,9 +129,11 @@ internal sealed class ControlService : ServiceBase
                         }
                         else
                         {
-                            byte[]? data = request.Command == 0 ? null : firmware.Call(request.Command, request.Write, request.Value, request.Value2);
+                            byte[]? data = request.Command == 0 ? null : request.Write && request.Command == 8
+                                ? performance.Manual(() => firmware.Call(request.Command, true, request.Value, request.Value2))
+                                : firmware.Call(request.Command, request.Write, request.Value, request.Value2);
                             if (request.Write && request.Command == 10) keys.InvalidateState();
-                            if (request.Write && request.Command == 8) { keys.InvalidatePerformance(); memory.Capture(); }
+                            if (request.Write && request.Command == 8) keys.InvalidatePerformance();
                             reply = new(true, data, firmware.Model);
                         }
                     }
@@ -122,7 +144,7 @@ internal sealed class ControlService : ServiceBase
                 catch (Exception ex) { Store.Log("Hardware pipe: " + ex); }
             }
             }
-            finally { lock (lifecycleGate) performanceMemory = null; }
+            finally { lock (lifecycleGate) automation = null; }
         }
         catch (Exception ex) { Store.Log("Hardware service: " + ex); Environment.ExitCode = 1; }
     }
@@ -243,7 +265,7 @@ internal static class ServiceInstaller
         if (ping?.Ok != true) throw new IOException("SukaService did not become ready.");
         using (var key = Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SukaControl"))
         {
-            key.SetValue("DisplayName", "SukaControl"); key.SetValue("DisplayVersion", "0.2.5"); key.SetValue("Publisher", "SuzukiNatsume"); key.SetValue("InstallLocation", target); key.SetValue("DisplayIcon", executable); key.SetValue("UninstallString", $"\"{executable}\" --uninstall"); key.SetValue("QuietUninstallString", $"\"{executable}\" --uninstall --quiet"); key.SetValue("NoModify", 1); key.SetValue("NoRepair", 1);
+            key.SetValue("DisplayName", "SukaControl"); key.SetValue("DisplayVersion", "0.2.6"); key.SetValue("Publisher", "SuzukiNatsume"); key.SetValue("InstallLocation", target); key.SetValue("DisplayIcon", executable); key.SetValue("UninstallString", $"\"{executable}\" --uninstall"); key.SetValue("QuietUninstallString", $"\"{executable}\" --uninstall --quiet"); key.SetValue("NoModify", 1); key.SetValue("NoRepair", 1);
         }
         CreateShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), "SukaControl.lnk"), executable);
         LegacyMigration.Complete(owner.Value);

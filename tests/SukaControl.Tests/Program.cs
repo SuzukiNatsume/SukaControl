@@ -12,6 +12,11 @@ void Test(string name, Action<string> run)
 void Assert(bool value) { if (!value) throw new Exception("Assertion failed"); }
 int Saved(string path) { using var json = JsonDocument.Parse(File.ReadAllText(path)); return json.RootElement.GetProperty("Mode").GetInt32(); }
 void Seed(string path, int mode) => File.WriteAllText(path, JsonSerializer.Serialize(new { Mode = mode }));
+PerformanceAutomation Automation(string p, Func<int> read, Action<int> write, Func<bool?> power, PerformancePolicy? policy = null)
+{
+    if (policy != null) File.WriteAllText(p + ".options", JsonSerializer.Serialize(policy));
+    return new(p + ".options", new PerformanceMemory(p, read, write, _ => { }), read, write, power, _ => { });
+}
 try
 {
     Test("first-start-records-actual-without-write", p => { int writes = 0; new PerformanceMemory(p, () => 2, _ => writes++, _ => { }).Restore(); Assert(writes == 0 && Saved(p) == 2); });
@@ -26,7 +31,20 @@ try
     Test("native-mode-change-is-checkpointed", p => { var memory = new PerformanceMemory(p, () => 2, _ => { }, _ => { }); memory.Remember(3); memory.Remember(0); Assert(Saved(p) == 3); memory.Remember(4); Assert(Saved(p) == 4); });
     Test("shutdown-reads-latest-and-freezes-later-observations", p => { var memory = new PerformanceMemory(p, () => 4, _ => { }, _ => { }); memory.Remember(2); memory.Finish(); memory.Remember(1); memory.Finish(); Assert(Saved(p) == 4); });
     Test("shutdown-read-error-preserves-last-good", p => { var memory = new PerformanceMemory(p, () => throw new IOException(), _ => { }, _ => { }); memory.Remember(3); memory.Finish(); Assert(Saved(p) == 3); });
-    Console.WriteLine($"{passed} performance persistence tests passed");
+    Test("policy-defaults-preserve-existing-behavior", p => { var a = Automation(p, () => 1, _ => throw new Exception(), () => true); Assert(a.Policy.RestoreOnStartup && !a.Policy.FullSpeedOnAC); });
+    Test("disabled-startup-restore-never-writes-mode", p => { Seed(p, 4); int writes = 0; var a = Automation(p, () => 2, _ => writes++, () => false, new(false, false)); a.Start(); Assert(writes == 0 && Saved(p) == 2); });
+    Test("AC-startup-takes-priority-over-restoration", p => { Seed(p, 2); int mode = 1; var writes = new List<int>(); var a = Automation(p, () => mode, m => { mode = m; writes.Add(m); }, () => true, new(true, true)); a.Start(); Assert(writes.SequenceEqual([4]) && Saved(p) == 4); });
+    Test("battery-startup-still-restores-if-enabled", p => { Seed(p, 2); int mode = 1; var a = Automation(p, () => mode, m => mode = m, () => false, new(true, true)); a.Start(); Assert(mode == 2); });
+    Test("AC-edge-only-and-respects-manual-override", p => { int mode = 2; bool ac = false; var writes = new List<int>(); var a = Automation(p, () => mode, m => { mode = m; writes.Add(m); }, () => ac, new(false, true)); a.Start(); ac = true; a.RefreshPower(); a.Manual(() => mode = 2); a.RefreshPower(); Assert(mode == 2 && writes.SequenceEqual([4])); ac = false; a.RefreshPower(); Assert(mode == 2); ac = true; a.RefreshPower(); Assert(mode == 4 && writes.SequenceEqual([4, 4])); });
+    Test("enabling-on-AC-applies-once", p => { int mode = 2; var writes = new List<int>(); var a = Automation(p, () => mode, m => { mode = m; writes.Add(m); }, () => true, new(false, false)); a.Start(); a.Set(2, true); a.Manual(() => mode = 2); a.Set(2, true); a.Set(1, true); a.RefreshPower(); Assert(mode == 2 && writes.SequenceEqual([4])); });
+    Test("disabled-AC-automation-does-not-switch", p => { int mode = 2; bool ac = false; var a = Automation(p, () => mode, _ => throw new Exception(), () => ac, new(false, true)); a.Start(); a.Set(2, false); ac = true; a.RefreshPower(); Assert(mode == 2 && !a.Policy.FullSpeedOnAC); });
+    Test("unknown-power-does-not-retrigger-AC", p => { int mode = 2; bool? ac = true; var writes = new List<int>(); var a = Automation(p, () => mode, m => { mode = m; writes.Add(m); }, () => ac, new(false, true)); a.Start(); a.Manual(() => mode = 2); ac = null; a.RefreshPower(); ac = true; a.RefreshPower(); Assert(mode == 2 && writes.SequenceEqual([4])); });
+    Test("already-full-speed-never-writes-again", p => { var a = Automation(p, () => 4, _ => throw new Exception(), () => true, new(false, true)); a.Start(); a.RefreshPower(); Assert(Saved(p) == 4); });
+    Test("AC-full-speed-failure-uses-balanced-fallback", p => { int mode = 2; var writes = new List<int>(); var a = Automation(p, () => mode, m => { writes.Add(m); if (m == 4) throw new IOException(); mode = m; }, () => true, new(false, true)); a.Start(); Assert(mode == 1 && Saved(p) == 1 && writes.SequenceEqual([4, 1])); });
+    Test("policy-survives-service-recreation", p => { var a = Automation(p, () => 2, _ => { }, () => false); a.Set(1, false); a.Set(2, true); var b = Automation(p, () => 2, _ => { }, () => false); Assert(!b.Policy.RestoreOnStartup && b.Policy.FullSpeedOnAC); });
+    Test("shutdown-prevents-late-AC-switch", p => { int mode = 2; bool ac = false; var a = Automation(p, () => mode, _ => throw new Exception(), () => ac, new(false, true)); a.Start(); a.Finish(); ac = true; a.RefreshPower(); Assert(Saved(p) == 2); });
+    Test("policy-IPC-rejects-unrelated-operations", p => { Assert(HardwareProtocol.Allowed(new(0x42)) && HardwareProtocol.Allowed(new(0x43, true, 1, 0)) && HardwareProtocol.Allowed(new(0x43, true, 2, 1))); Assert(!HardwareProtocol.Allowed(new(0x42, true)) && !HardwareProtocol.Allowed(new(0x43, true, 0, 1)) && !HardwareProtocol.Allowed(new(0x43, true, 2, 2)) && !HardwareProtocol.Allowed(new(0x43, true, 1, 1, Payload: []))); });
+    Console.WriteLine($"{passed} performance persistence and automation tests passed");
 }
 finally
 {
