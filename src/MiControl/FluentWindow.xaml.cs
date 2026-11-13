@@ -413,7 +413,7 @@ internal partial class FluentWindow : W.Window
         var actions = Horizontal(Button("refresh", InitializeHardware), Button("diagnostics", async () => { string path = await Diagnostics.Write(); Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true }); }), Button("logs", () => Process.Start(new ProcessStartInfo(Store.Root) { UseShellExecute = true }))); actions.Margin = new(0, 12, 0, 12); page.Children.Add(actions);
         if (!HardwareClient.Installed) page.Children.Add(Setting("installService", "serviceNote", Button("installService", async () => { var process = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--install-service --owner-sid " + System.Security.Principal.WindowsIdentity.GetCurrent().User!.Value) { UseShellExecute = true, Verb = "runas" }); if (process != null) await process.WaitForExitAsync(); if (!HardwareClient.Installed) throw new IOException("Service install failed."); await InitializeHardware(); })));
         Section(page, "about");
-        var about = new C.StackPanel(); about.Children.Add(Text($"SukaControl {typeof(FluentWindow).Assembly.GetName().Version?.ToString(3)}"));
+        var about = new C.StackPanel(); about.Children.Add(Text($"SukaControl {Store.Version}"));
         var author = new System.Windows.Documents.Hyperlink(new System.Windows.Documents.Run("SuzukiNatsume")) { NavigateUri = new Uri("https://github.com/SuzukiNatsume") };
         author.RequestNavigate += (_, e) => { Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true }); e.Handled = true; };
         var link = Text(""); link.Margin = new(0, 8, 0, 0); link.Inlines.Add(author); about.Children.Add(link); page.Children.Add(Card(about));

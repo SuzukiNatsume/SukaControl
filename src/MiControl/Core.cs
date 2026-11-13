@@ -7,6 +7,7 @@ namespace SukaControl;
 
 internal static class Store
 {
+    public static string Version => typeof(Store).Assembly.GetName().Version!.ToString(3);
     public static bool ServiceMode { get; set; }
     public static string Root => Path.Combine(Environment.GetFolderPath(ServiceMode ? Environment.SpecialFolder.CommonApplicationData : Environment.SpecialFolder.LocalApplicationData), "SukaControl");
     public static readonly JsonSerializerOptions Json = new() { WriteIndented = true };

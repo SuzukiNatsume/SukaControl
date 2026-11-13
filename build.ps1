@@ -1,6 +1,8 @@
 $ErrorActionPreference='Stop'
 Push-Location $PSScriptRoot
 try {
+    $version=([xml](Get-Content 'Directory.Build.props' -Raw)).Project.PropertyGroup.Version
+    if($version -notmatch '^\d+\.\d+\.\d+$'){throw 'Invalid release version'}
     $releaseRoot=Join-Path $PSScriptRoot 'dist/SukaControl'
     $serviceRoot=Join-Path $PSScriptRoot 'dist/ServicePayload'
     foreach($outputRoot in @($releaseRoot,$serviceRoot)){
@@ -22,6 +24,10 @@ try {
         New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
         if ($file.Name -like "SukaService.*" -or !(Test-Path -LiteralPath $destination)) { Copy-Item -LiteralPath $file.FullName -Destination $destination -Force }
     }
+    foreach($name in @('SukaControl.dll','Suka.Core.dll','SukaService.dll')){
+        $actual=[Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $releaseRoot $name)).ProductVersion.Split('+')[0]
+        if($actual -ne $version){throw "Component version mismatch: $name ($actual / $version)"}
+    }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $payload=Join-Path $PSScriptRoot 'installer/payload.zip'
     if(Test-Path -LiteralPath $payload){Remove-Item -LiteralPath $payload}
@@ -34,7 +40,15 @@ try {
         }
     }finally{$archive.Dispose()}
     $compiler=Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
-    & $compiler /nologo /target:winexe /platform:x64 /win32icon:src\MiControl\Assets\MiControl.ico /out:dist\SukaControl-Setup-0.2.11.exe /win32manifest:installer\setup.manifest /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll '/resource:installer\payload.zip,payload.zip' installer\Setup.cs
+    $installer=Join-Path $PSScriptRoot "dist/SukaControl-Setup-$version.exe"
+    $manifest=[xml](Get-Content 'installer/setup.manifest' -Raw)
+    $manifest.assembly.assemblyIdentity.version="$version.0"
+    $manifestPath=Join-Path $PSScriptRoot 'dist/setup.manifest'
+    $manifest.Save($manifestPath)
+    $versionSource=Join-Path $PSScriptRoot 'dist/SetupVersion.cs'
+    [IO.File]::WriteAllText($versionSource,"[assembly:System.Reflection.AssemblyVersion(""$version.0"")][assembly:System.Reflection.AssemblyFileVersion(""$version.0"")][assembly:System.Reflection.AssemblyInformationalVersion(""$version"")][assembly:System.Reflection.AssemblyProduct(""SukaControl"")]")
+    & $compiler /nologo /target:winexe /platform:x64 /win32icon:src\MiControl\Assets\MiControl.ico "/out:$installer" "/win32manifest:$manifestPath" /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll '/resource:installer\payload.zip,payload.zip' installer\Setup.cs $versionSource
     if($LASTEXITCODE -ne 0){throw 'Installer build failed.'}
-    Get-FileHash dist/SukaControl-Setup-0.2.11.exe -Algorithm SHA256 | Format-List
+    if([Diagnostics.FileVersionInfo]::GetVersionInfo($installer).ProductVersion -ne $version){throw 'Installer version mismatch'}
+    Get-FileHash $installer -Algorithm SHA256 | Format-List
 }finally{Pop-Location}

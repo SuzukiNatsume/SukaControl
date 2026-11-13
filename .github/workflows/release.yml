@@ -35,7 +35,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = ([xml](Get-Content src/MiControl/MiControl.csproj -Raw)).Project.PropertyGroup.Version
+          $version = ([xml](Get-Content Directory.Build.props -Raw)).Project.PropertyGroup.Version
           if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag does not match application version' }
           $installer = "dist/SukaControl-Setup-$version.exe"
           $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
