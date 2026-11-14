@@ -95,6 +95,38 @@ internal sealed class Lighting(bool allowRemote = true) : ILighting
     // OEM Get/SetKbdAreaStatus: keyboard bits 0/1, logo bit 5, cover/bar bit 4.
     internal static byte AreaMask(int area) => area switch { 0 => 3, 1 => 0x20, 2 => 0x10, _ => throw new ArgumentOutOfRangeException(nameof(area)) };
     internal static bool AreaEnabled(byte flags, int area) => (flags & (area == 0 ? 2 : AreaMask(area))) != 0;
+    internal static byte SavedAreaFlags(byte flags)
+    {
+        if (!AreaEnabled(flags, 0) && (flags & 4) == 0) flags &= unchecked((byte)~0x10);
+        int logoLink = (flags >> 6) & 3;
+        if ((logoLink == 0 && !AreaEnabled(flags, 0)) || (logoLink == 2 && !AreaEnabled(flags, 2))) flags &= unchecked((byte)~0x20);
+        return flags;
+    }
+    internal static byte[] HardwareFallback(byte[] state, byte[]? known = null)
+    {
+        _ = SettingsPayload(state, false);
+        var result = (byte[])state.Clone();
+        if (result[5] is not (0 or 0xff)) return result;
+        if (known is { Length: >= 64 } && known[5] is not (0 or 0xff))
+        {
+            Array.Copy(known, 5, result, 5, 7); Array.Copy(known, 13, result, 13, 51);
+        }
+        else { result[5] = 11; result[6] = 0; result[7] = 0; result[9] = 0; }
+        return result; // Keep the current area flags, including explicit off.
+    }
+    internal static async Task RestoreCommon(ILighting lighting, byte[] state)
+    {
+        var desired = HardwareFallback(state);
+        var payload = SettingsPayload(desired, false);
+        // FF is a color update, so it cannot leave real-time mode by itself.
+        if (payload[2] == 0xff)
+        {
+            var parameters = (byte[])payload.Clone(); parameters[2] = 0;
+            await lighting.Exchange(2, parameters);
+        }
+        await lighting.Exchange(2, payload);
+        await Confirm(lighting.ReadConfig, actual => actual[12] == desired[12] && (!AreaEnabled(desired[12], 0) || (actual[5] == desired[5] && actual[8] == desired[8])), "灯效恢复或开关回读不一致。");
+    }
     internal static byte[] SettingsPayload(byte[] state, bool normalMode)
     {
         if (state.Length < 64 || state[1] != 0x57 || state[2] != 0xab || state[3] != 1) throw new ArgumentException("Invalid lighting configuration.");

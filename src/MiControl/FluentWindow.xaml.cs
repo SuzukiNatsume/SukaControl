@@ -377,7 +377,7 @@ internal partial class FluentWindow : W.Window
     async Task ResumeSavedSoftwareLighting()
     {
         if (preferences.SoftwareLighting is not { Effect: "screenSync" or "audioSync" or "soft" } preset) return;
-        try { await LightingOperation(async () => { if (keyboardBrightness != null) { updating = true; keyboardBrightness.Value = Math.Clamp(preset.Brightness, 0, 3); updating = false; } await StartSoftwareLighting(preset); activeSoftwareLighting = preset; }); }
+        try { await LightingOperation(async () => { if (softwareLighting.Running || lightingSession.Pending || !Lighting.AreaEnabled((await lighting.ReadConfig())[12], 0)) return; if (keyboardBrightness != null) { updating = true; keyboardBrightness.Value = Math.Clamp(preset.Brightness, 0, 3); updating = false; } await StartSoftwareLighting(preset); activeSoftwareLighting = preset; }); }
         catch (Exception ex) { Store.Log("Saved software lighting: " + ex); Status(L.Error(ex), true); }
     }
     void BuildDisplay()
@@ -421,7 +421,7 @@ internal partial class FluentWindow : W.Window
     async Task InitializeHardware()
     {
         try { await Task.Run(firmware.Connect); firmwareText.Text = L.T("connected"); } catch (Exception ex) { firmwareText.Text = L.Error(ex); }
-        try { lighting.Detect(); var config = await lighting.ReadConfig(); for (int i = 0; i < 3; i++) lightSwitches[i].IsChecked = Lighting.AreaEnabled(config[12], i); lightingText.Text = L.T("connected"); } catch (Exception ex) { lightingText.Text = L.Error(ex); }
+        try { lighting.Detect(); var config = await lighting.ReadConfig(); bool wasUpdating = updating; updating = true; try { for (int i = 0; i < 3; i++) lightSwitches[i].IsChecked = Lighting.AreaEnabled(config[12], i); } finally { updating = wasUpdating; } lightingText.Text = L.T("connected"); } catch (Exception ex) { lightingText.Text = L.Error(ex); }
         await UpdateModes(); await PollKeys(); await Poll(); Status(L.T("ready")); await ResumeSavedSoftwareLighting(); hardwareReady.TrySetResult();
     }
     async Task UpdateModes()
@@ -566,7 +566,7 @@ internal partial class FluentWindow : W.Window
         {
             await softwareLighting.Stop(); activeSoftwareLighting = null; keyboardPreviewChanged = false;
             await lightingSession.Revert();
-            if (preferences.SoftwareLighting is { Effect: "screenSync" or "audioSync" or "soft" } saved)
+            if (preferences.SoftwareLighting is { Effect: "screenSync" or "audioSync" or "soft" } saved && Lighting.AreaEnabled((await lighting.ReadConfig())[12], 0))
             {
                 try { await StartSoftwareLighting(saved); activeSoftwareLighting = saved; }
                 catch (Exception ex) { Store.Log("Resume saved lighting after preview: " + ex); }
@@ -605,6 +605,48 @@ internal partial class FluentWindow : W.Window
         }
         catch (Exception ex) { result["passed"] = false; result["error"] = ex.ToString(); }
         finally { await RevertLighting(); }
+        return result;
+    }
+    internal async Task<Dictionary<string, object?>> TestLightingOffUI()
+    {
+        var result = new Dictionary<string, object?>();
+        await RevertLighting();
+        var original = Lighting.HardwareFallback(await lighting.ReadConfig());
+        var savedPreference = preferences.SoftwareLighting;
+        try
+        {
+            preferences.SoftwareLighting = null;
+            var setup = (byte[])original.Clone(); setup[5] = 11; setup[6] = 0; setup[7] = setup[9] = 0; setup[12] = (byte)((setup[12] & 8) | 0xb3);
+            await Lighting.RestoreCommon(lighting, setup); await PollKeys(); SelectPage("lighting");
+            async Task ToggleKeyboardOff()
+            {
+                lightSwitches[0].IsChecked = false;
+                lightSwitches[0].RaiseEvent(new W.RoutedEventArgs(C.Primitives.ButtonBase.ClickEvent));
+                for (int i = 0; i < 100 && (saveLightingButton?.IsEnabled != true || Lighting.AreaEnabled((await lighting.ReadConfig())[12], 0)); i++) await Task.Delay(30);
+                if (!lightingSession.Pending || saveLightingButton?.IsEnabled != true || Lighting.AreaEnabled((await lighting.ReadConfig())[12], 0)) throw new IOException("Off preview was not available for saving.");
+            }
+            await ToggleKeyboardOff();
+            await CloseToTray();
+            result["unsavedOffReverts"] = (await lighting.ReadConfig())[12] == setup[12];
+            Restore(); await PollKeys(); await ToggleKeyboardOff();
+            saveLightingButton!.RaiseEvent(new W.RoutedEventArgs(C.Button.ClickEvent));
+            for (int i = 0; i < 100 && lightingSession.Pending; i++) await Task.Delay(30);
+            var saved = await lighting.ReadConfig();
+            result["savedOffAndFollowChain"] = !lightingSession.Pending && (saved[12] & 0x33) == 0 && (saved[12] & 0xc4) == 0x80;
+            preferences.SoftwareLighting = new("soft", Color.White.ToArgb(), 2, 2, false, null);
+            await InitializeHardware();
+            result["staleSoftwarePresetDoesNotReenable"] = !softwareLighting.Running && ((await lighting.ReadConfig())[12] & 0x33) == 0 && !lightingSession.Pending;
+            await CloseToTray(); Restore(); await InitializeHardware();
+            result["reopenStaysOff"] = ((await lighting.ReadConfig())[12] & 0x33) == 0 && lightSwitches.All(control => control.IsChecked == false) && !softwareLighting.Running;
+            result["passed"] = result.Values.All(value => value is true);
+        }
+        catch (Exception ex) { result["passed"] = false; result["error"] = ex.ToString(); }
+        finally
+        {
+            await RevertLighting(); await Lighting.RestoreCommon(lighting, original); await lighting.Save();
+            preferences.SoftwareLighting = savedPreference; preferences.Save();
+            result["originalAreaFlagsRestored"] = (await lighting.ReadConfig())[12] == original[12];
+        }
         return result;
     }
     internal async Task<Dictionary<string, object?>> TestSoftwareLightingUI()

@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    
+
     <AssemblyName>SukaControl</AssemblyName>
     <RootNamespace>SukaControl</RootNamespace>
     <ApplicationIcon>Assets\MiControl.ico</ApplicationIcon>

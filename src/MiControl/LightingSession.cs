@@ -10,7 +10,7 @@ internal sealed class LightingSession(ILighting lighting, Func<byte[]?>? softwar
     async Task<Snapshot> Capture()
     {
         var config = await lighting.ReadConfig();
-        if (config[5] is 0 or 0xff) config = softwareBaseline?.Invoke() ?? throw new IOException("A hardware fallback is required for software lighting.");
+        config = Lighting.HardwareFallback(config, softwareBaseline?.Invoke());
         return new(config, await lighting.Exchange(0xc, 0), await lighting.Exchange(0xc, 1), await lighting.Exchange(0xa, 0), await lighting.Exchange(0xa, 1));
     }
     public async Task Apply(Func<Task> action)
@@ -22,7 +22,16 @@ internal sealed class LightingSession(ILighting lighting, Func<byte[]?>? softwar
     public async Task Save()
     {
         await gate.WaitAsync();
-        try { if (baseline == null) return; if ((await lighting.ReadConfig())[5] is 0 or 0xff) throw new IOException("Stop software lighting and apply its hardware fallback before saving."); await lighting.Save(); baseline = null; }
+        try
+        {
+            if (baseline == null) return;
+            var actual = await lighting.ReadConfig();
+            if (actual[5] is 0 or 0xff && Lighting.AreaEnabled(actual[12], 0)) throw new IOException("Stop software lighting and apply its hardware fallback before saving.");
+            var desired = Lighting.HardwareFallback(actual, baseline.Config);
+            desired[12] = Lighting.SavedAreaFlags(desired[12]);
+            if (!desired.AsSpan(5, 59).SequenceEqual(actual.AsSpan(5, 59))) await Lighting.RestoreCommon(lighting, desired);
+            await lighting.Save(); baseline = null;
+        }
         finally { gate.Release(); }
     }
     internal static byte[] AccentColor(byte selector, byte[] state)
@@ -41,9 +50,14 @@ internal sealed class LightingSession(ILighting lighting, Func<byte[]?>? softwar
             await lighting.Exchange(0xd, saved.Bar.Skip(4).Take(3).ToArray());
             await lighting.Exchange(0xb, AccentColor(0, saved.LogoColor));
             await lighting.Exchange(0xb, AccentColor(1, saved.BarColor));
-            await lighting.Exchange(2, Lighting.SettingsPayload(saved.Config, false));
+            await Lighting.RestoreCommon(lighting, saved.Config);
             var actual = await lighting.ReadConfig();
-            if (!actual.AsSpan(5, 59).SequenceEqual(saved.Config.AsSpan(5, 59))) throw new IOException("Lighting preview rollback did not match hardware readback.");
+            // With the keyboard off, firmware may return FF instead of the
+            // inactive effect. Its area flags remain authoritative.
+            bool restored = Lighting.AreaEnabled(saved.Config[12], 0)
+                ? actual.AsSpan(5, 59).SequenceEqual(saved.Config.AsSpan(5, 59))
+                : actual[12] == saved.Config[12];
+            if (!restored) throw new IOException("Lighting preview rollback did not match hardware readback.");
             baseline = null;
         }
         finally { gate.Release(); }

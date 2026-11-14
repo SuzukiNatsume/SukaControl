@@ -60,6 +60,16 @@ try
     Test("accent-preview-restores-mode-and-RGB", p => { var h = new FakeLighting(); var session = new LightingSession(h); session.Apply(() => { h.Logo[5] = 2; h.Color[6] = 99; return Task.CompletedTask; }).GetAwaiter().GetResult(); session.Revert().GetAwaiter().GetResult(); Assert(h.Logo[5] == 0 && h.Color[6] == 10 && h.Saves == 0); });
     Test("save-command-and-RGB-read-are-bounded", p => { Assert(HardwareProtocol.Allowed(new(0x50, true, 5, Payload: []))); Assert(!HardwareProtocol.Allowed(new(0x50, true, 5, Payload: [1]))); Assert(HardwareProtocol.Allowed(new(0x50, true, 0xa, Payload: [1])) && !HardwareProtocol.Allowed(new(0x50, true, 0xa, Payload: [2]))); Assert(HardwareProtocol.Allowed(new(0x50, true, 4, Payload: new byte[61])) && !HardwareProtocol.Allowed(new(0x50, true, 4, Payload: new byte[60]))); });
     Test("software-state-cannot-be-saved-to-controller", p => { var h = new FakeLighting(); var session = new LightingSession(h); session.Apply(() => { h.Config[5] = 0; return Task.CompletedTask; }).GetAwaiter().GetResult(); bool failed = false; try { session.Save().GetAwaiter().GetResult(); } catch (IOException) { failed = true; } Assert(failed && h.Saves == 0 && session.Pending); session.Revert().GetAwaiter().GetResult(); });
+    Test("disabled-live-state-can-be-saved-without-reenabling", p => { var h = new FakeLighting(); h.Config[5] = 0; h.Config[12] = 0; var session = new LightingSession(h); session.Apply(() => Task.CompletedTask).GetAwaiter().GetResult(); session.Save().GetAwaiter().GetResult(); Assert(h.Saves == 1 && h.Config[5] == 11 && h.Config[12] == 0 && !session.Pending); });
+    Test("firmware-FF-off-sentinel-is-saveable-and-revertible", p => { var h = new FakeLighting { OffSentinel = true }; h.Config[12] = 0; var session = new LightingSession(h); session.Apply(() => Task.CompletedTask).GetAwaiter().GetResult(); session.Revert().GetAwaiter().GetResult(); session.Apply(() => Task.CompletedTask).GetAwaiter().GetResult(); session.Save().GetAwaiter().GetResult(); Assert(h.Saves == 1 && h.Config[12] == 0 && !session.Pending); });
+    Test("failed-off-save-keeps-original-state-for-rollback", p => { var h = new FakeLighting { FailSave = true, OffSentinel = true }; var before = h.Config[12]; var session = new LightingSession(h); session.Apply(() => { h.Config[12] = 0; return Task.CompletedTask; }).GetAwaiter().GetResult(); try { session.Save().GetAwaiter().GetResult(); } catch (IOException) { } Assert(session.Pending && h.Saves == 0); session.Revert().GetAwaiter().GetResult(); Assert(h.Config[12] == before); });
+    Test("off-preview-does-not-save-and-rolls-back", p => { var h = new FakeLighting(); var original = h.Config[12]; var session = new LightingSession(h); session.Apply(() => { h.Config[12] = 0; return Task.CompletedTask; }).GetAwaiter().GetResult(); Assert(h.Saves == 0); session.Revert().GetAwaiter().GetResult(); Assert(h.Config[12] == original && h.Saves == 0); });
+    Test("saved-follow-chain-stays-off-in-new-session", p => { var h = new FakeLighting(); h.Config[12] = 0xb3; var session = new LightingSession(h); session.Apply(() => { h.Config[12] &= 0xfc; return Task.CompletedTask; }).GetAwaiter().GetResult(); session.Save().GetAwaiter().GetResult(); var next = new LightingSession(h); Assert(h.Config[12] == 0x80 && h.Saves == 1 && !next.Pending); session.Revert().GetAwaiter().GetResult(); Assert(h.Config[12] == 0x80); });
+    Test("independent-areas-do-not-follow-keyboard-off", p => { Assert(Lighting.SavedAreaFlags(0x74) == 0x74); });
+    Test("logo-follow-bar-closes-when-bar-off", p => { Assert(Lighting.SavedAreaFlags(0xa3) == 0x83); });
+    Test("logo-follow-keyboard-ignores-independent-bar", p => { Assert(Lighting.SavedAreaFlags(0x34) == 0x14); });
+    Test("save-never-reenables-already-off-followers", p => { Assert(Lighting.SavedAreaFlags(3) == 3); });
+    Test("fallback-from-live-keeps-disabled-area-flags", p => { var state = Config(0); state[12] = 0x80; var known = Config(2); known[12] = 0x33; var result = Lighting.HardwareFallback(state, known); Assert(result[5] == 2 && result[12] == 0x80 && state[5] == 0); });
     Test("software-preview-uses-hardware-fallback-for-rollback", p => { var h = new FakeLighting(); var fallback = (byte[])h.Config.Clone(); h.Config[5] = 0xff; var session = new LightingSession(h, () => fallback); session.Apply(() => Task.CompletedTask).GetAwaiter().GetResult(); session.Revert().GetAwaiter().GetResult(); Assert(h.Config[5] == 11 && h.Saves == 0); });
     Test("audio-right-channel-is-not-ignored", p => Assert(Math.Abs(AudioSampleDecoder.ReadFrame([0, 0, 0, 64], 16, false) - .5f) < .001f));
     Test("audio-PCM32-is-not-treated-as-float", p => Assert(Math.Abs(AudioSampleDecoder.ReadFrame(BitConverter.GetBytes(1073741824), 32, false) - .5f) < .001f));
@@ -84,13 +94,14 @@ sealed class FakeLighting : ILighting
     public byte[] Color { get; } = new byte[65];
     public int Saves;
     public bool FailSave;
+    public bool OffSentinel;
     public FakeLighting()
     {
         foreach (var (state, command) in new[] { (Config, 1), (Logo, 12), (bar, 12), (Color, 10), (barColor, 10) }) { state[1] = 0x57; state[2] = 0xab; state[3] = (byte)command; }
         Config[5] = 11; Config[8] = 2; Config[12] = 0x32; bar[4] = barColor[4] = 1; bar[5] = 3; Color[6] = barColor[6] = 10; Color[7] = barColor[7] = 20; Color[8] = barColor[8] = 30;
     }
     public Task Brightness(byte value) { Config[8] = value; return Task.CompletedTask; }
-    public Task<byte[]> ReadConfig() => Task.FromResult((byte[])Config.Clone());
+    public Task<byte[]> ReadConfig() { var value = (byte[])Config.Clone(); if (OffSentinel && !Lighting.AreaEnabled(value[12], 0)) value[5] = 0xff; return Task.FromResult(value); }
     public Task Save() { if (FailSave) throw new IOException(); Saves++; return Task.CompletedTask; }
     public Task<byte[]> Exchange(byte command, params byte[] payload)
     {

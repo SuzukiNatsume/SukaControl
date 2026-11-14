@@ -34,7 +34,7 @@ internal sealed class SoftwareLighting : IAsyncDisposable
         await Stop();
         Interlocked.Exchange(ref framesWritten, 0); changedFrames = 0; previousFrameHash = 0;
         Interlocked.Exchange(ref audioFramesReceived, 0); Volatile.Write(ref audioPeak, 0); Volatile.Write(ref spectrum, new double[17]); samplePosition = 0;
-        original = await lighting.ReadConfig();
+        original = Lighting.HardwareFallback(await lighting.ReadConfig());
         try
         {
             // OEM SetRealMode preserves the common report and changes only mode.
@@ -150,7 +150,7 @@ internal sealed class SoftwareLighting : IAsyncDisposable
             var saved = Lighting.SettingsPayload(restore, false);
             Array.Copy(saved, 1, current, 1, 7); Array.Copy(saved, 9, current, 9, 51);
             current[8] = (byte)((current[8] & ~Lighting.AreaMask(0)) | (saved[8] & Lighting.AreaMask(0)));
-            await lighting.Exchange(2, current);
+            await Lighting.RestoreCommon(lighting, Lighting.Report(1, current));
         }
     }
     public async ValueTask DisposeAsync() => await Stop();
